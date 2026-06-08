@@ -26,8 +26,11 @@ from dataclasses import dataclass
 import re
 
 from . import scale as _scale
-from .geometry import extract_pdf_geometry
 from .models import GeometryPath, SheetGeometry, StyleKey
+
+# NB: ``geometry`` (and its ``fitz`` import) is loaded lazily in ``main`` only —
+# every helper here runs on pure models, so importing this module and using its
+# diagnostics must not require the PyMuPDF backend. See test_diagnose.py.
 
 _BEZIER_SAMPLES = 16
 
@@ -282,6 +285,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--page", type=int, default=0, help="0-based page index (default 0)")
     ap.add_argument("--out", default=None, help="also write the report to this file")
     args = ap.parse_args(argv)
+
+    # Deferred so the pure helpers above stay importable without PyMuPDF.
+    from .geometry import extract_pdf_geometry
 
     geoms = extract_pdf_geometry(args.pdf, pages=[args.page])
     report = build_report(geoms[0])

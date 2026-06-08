@@ -5,6 +5,10 @@ are exercised on exact synthetic geometry.
 """
 from __future__ import annotations
 
+import subprocess
+import sys
+import textwrap
+
 import pytest
 
 from drawing_takeoff import diagnose
@@ -61,6 +65,31 @@ def test_build_report_passes_and_has_all_sections(geom_with_one_pipe):
     assert "KNOWN-DIMENSION CHECK" in report
     assert "PASS" in report
     assert "1/8" in report  # the detected label echoes back
+
+
+def test_pure_layer_imports_without_pymupdf():
+    """The pure layer (models/scale/diagnose) must import with PyMuPDF absent.
+
+    Runs in a fresh interpreter with ``fitz`` forced unavailable, so a stray
+    top-level ``geometry`` import (which would pull in ``fitz``) regresses this.
+    Building a report on hand-made geometry must work without the backend.
+    """
+    code = textwrap.dedent(
+        """
+        import sys
+        sys.modules["fitz"] = None  # any `import fitz` now raises ImportError
+        from drawing_takeoff import diagnose, scale, models
+        g = models.SheetGeometry(
+            ref=models.SheetRef("x", 0), page_width_pt=10, page_height_pt=10,
+            scale_label='1/8" = 1\\'-0"', points_per_foot=9.0,
+        )
+        assert "(c) SCALE" in diagnose.build_report(g)
+        print("ok")
+        """
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "ok"
 
 
 def test_scale_check_without_ppf_is_empty():
