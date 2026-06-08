@@ -1,9 +1,10 @@
 """drawing-takeoff — vector-geometry quantity takeoffs from construction-drawing PDFs.
 
-POC scaffold. The public engine entry point (``extract_takeoff``) arrives in
-``pipeline.py`` at milestone M4; until then this package ships only the vendored
-``core`` infrastructure (Anthropic client, model config, pricing, token
-estimates) copied and rebranded from the sibling ``drawing-analyzer`` project.
+POC scaffold. The public engine entry point (``extract_takeoff`` in
+``pipeline.py``) is an importable stub from milestone M0 and is implemented at
+milestone M4; until then this package ships the vendored ``core`` infrastructure
+(Anthropic client, model config, pricing, token estimates) copied and rebranded
+from the sibling ``drawing-analyzer`` project.
 
 See ``IMPLEMENTATION_PLAN.md`` for the milestone plan and ``KICKOFF.md`` for the
 handoff instructions.
