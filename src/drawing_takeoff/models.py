@@ -151,3 +151,28 @@ class Run:
     def centroid(self) -> Point:
         x0, y0, x1, y1 = self.bbox
         return ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+
+
+@dataclass(frozen=True)
+class SystemLabel:
+    """What a line style *means* — the output of the M3 legend/recognition step.
+
+    Construction legends are unreliable (incomplete, on a different sheet, or
+    contradicted by the drawing), so a label carries its own ``confidence`` and
+    an explicit ``ambiguous`` flag: the engine totals only styles it can stand
+    behind and surfaces the rest for human review rather than guessing.
+    ``measurable`` separates a linear run (pipe/duct/conduit/wall) from
+    background/text/symbol linework that must never enter a length total.
+    """
+
+    system: str
+    measurable: bool
+    confidence: str = "low"          # "high" | "medium" | "low"
+    ambiguous: bool = False
+    size: str | None = None
+    reasoning: str | None = None
+
+    @property
+    def trusted(self) -> bool:
+        """Safe to auto-total: a measurable run, not ambiguous, decent confidence."""
+        return self.measurable and not self.ambiguous and self.confidence in ("high", "medium")

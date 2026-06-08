@@ -77,3 +77,19 @@ def test_words_carry_text_and_coords(synthetic_pdf):
     assert "10-0" in texts
     # the line of geometry is not text; words are only the inserted strings
     assert any("1/8" in t for t in texts)
+
+
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def test_render_style_swatch_produces_png():
+    from drawing_takeoff.models import StyleKey
+
+    sk = StyleKey.from_path_attrs((0.0, 0.0, 0.0), 1.3, "[] 0")
+    png = geometry.render_style_swatch(sk)
+    assert png[:8] == _PNG_MAGIC
+
+
+def test_render_page_png(synthetic_pdf):
+    png = geometry.render_page_png(synthetic_pdf, 0, dpi=72)
+    assert png[:8] == _PNG_MAGIC

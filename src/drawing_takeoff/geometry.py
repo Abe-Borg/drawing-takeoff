@@ -123,3 +123,48 @@ def extract_pdf_geometry(
             ref = SheetRef(source=pdf_path, page_index=i)
             out.append(extract_sheet_geometry(page, ref=ref))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Rasterizers for the M3 legend/recognition step (PNG bytes -> legend.py)
+# ---------------------------------------------------------------------------
+def render_style_swatch(style_key, *, width_px: int = 240, height_px: int = 48, dpi: float = 2.0) -> bytes:
+    """Render a sample line drawn in ``style_key``'s pen as PNG bytes.
+
+    Lets the recognition model *see* what a style looks like (heavy black solid
+    vs. thin gray dashed) alongside its stats. Uses a synthetic one-line page so
+    no source PDF is needed.
+    """
+    doc = fitz.open()
+    w_pt, h_pt = width_px / dpi, height_px / dpi
+    page = doc.new_page(width=w_pt, height=h_pt)
+    shape = page.new_shape()
+    y = h_pt / 2.0
+    shape.draw_line(fitz.Point(w_pt * 0.08, y), fitz.Point(w_pt * 0.92, y))
+    color = style_key.stroke_color or (0.0, 0.0, 0.0)
+    shape.finish(color=tuple(color), width=max(style_key.width or 0.3, 0.3), dashes=style_key.dashes)
+    shape.commit()
+    pix = page.get_pixmap(matrix=fitz.Matrix(dpi, dpi), alpha=False)
+    data = pix.tobytes("png")
+    doc.close()
+    return data
+
+
+def render_page_png(
+    pdf_path: str,
+    page_index: int = 0,
+    *,
+    dpi: int = 150,
+    clip: tuple[float, float, float, float] | None = None,
+) -> bytes:
+    """Rasterize a page (or a ``clip`` region of it) to PNG bytes.
+
+    Used to hand the recognition model a legend/symbols image off the lead
+    sheet, or a crop of the drawing for context.
+    """
+    with fitz.open(pdf_path) as doc:
+        page = doc[page_index]
+        mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+        clip_rect = fitz.Rect(*clip) if clip is not None else None
+        pix = page.get_pixmap(matrix=mat, clip=clip_rect, alpha=False)
+        return pix.tobytes("png")
