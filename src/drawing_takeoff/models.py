@@ -127,3 +127,27 @@ class SheetGeometry:
     def non_degenerate_paths(self) -> list[GeometryPath]:
         """Paths with real extent (drops the zero-length stipple artifacts)."""
         return [p for p in self.paths if not p.is_degenerate]
+
+
+@dataclass(frozen=True)
+class Run:
+    """A stitched, maximally-straight run of one style — the unit of measurement.
+
+    Fragments the CAD export split along one straight line are stitched back
+    into a single ``Run`` (see :func:`drawing_takeoff.measure.stitch_runs`), so
+    ``length_pt`` is the honest drawn length and the per-style total is a sum of
+    runs rather than fragments. ``length_ft`` is filled when a ``points_per_foot``
+    is known. A direction change (elbow) or junction (tee) starts a new run.
+    """
+
+    style_key: StyleKey
+    polyline: tuple[Point, ...]
+    length_pt: float
+    bbox: BBox
+    length_ft: float | None = None
+    segment_count: int = 1
+
+    @property
+    def centroid(self) -> Point:
+        x0, y0, x1, y1 = self.bbox
+        return ((x0 + x1) / 2.0, (y0 + y1) / 2.0)

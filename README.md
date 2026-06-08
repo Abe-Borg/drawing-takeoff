@@ -5,10 +5,10 @@ PDFs. Measurement runs on exact PyMuPDF **vector geometry** (resolution-independ
 sheet, in PDF points); Claude vision is used **surgically** — read the legend once, then
 propagate system labels to every same-styled line by exact style match.
 
-> **Status: M1 (geometry + scale proof) ships.** Vendored `core/` infra plus the
-> backend-free engine layer — `geometry.py` (the only PyMuPDF module), `models.py`,
-> `scale.py`, and a `diagnose` report. Measurement primitives (M2), legend labeling
-> (M3), and the GUI/CSV pipeline (M4) are next. See **`IMPLEMENTATION_PLAN.md`** for the
+> **Status: M2 (linear measurement) ships.** Vendored `core/` infra plus the backend-free
+> engine — `geometry.py` (the only PyMuPDF module), `models.py`, `scale.py`, `measure.py`
+> (run stitching + per-style footage), and `diagnose`/`measure` reports. Legend labeling
+> (M3) and the GUI/CSV pipeline (M4) are next. See **`IMPLEMENTATION_PLAN.md`** for the
 > milestone plan and **`KICKOFF.md`** for the handoff.
 
 ## Install & test
@@ -25,6 +25,13 @@ Run the M1 go/no-go diagnostic on a vector sheet (cleanliness / instances / scal
 
 ```bash
 python -m drawing_takeoff.diagnose path/to/sheet.pdf [--out report.txt]
+```
+
+Run the M2 linear-measurement report (per-style footage + total, cross-checked against any
+dimension callouts on the sheet):
+
+```bash
+python -m drawing_takeoff.measure path/to/sheet.pdf [--out report.txt]
 ```
 
 ## Scale (the simplifying assumption)
@@ -44,10 +51,11 @@ src/drawing_takeoff/
   models.py            # M1: backend-free data models (no PyMuPDF import)
   scale.py             # M1: scale-label -> points_per_foot; dimension verifier
   diagnose.py          # M1: go/no-go diagnostic report (pure; runs on models)
+  measure.py           # M2: length primitives, run stitching, per-style footage
   pipeline.py          # M0 stub: extract_takeoff seam (implemented at M4)
-  # next per the plan:  measure.py (M2), legend.py (M3), export.py + gui.py (M4)
-tests/                 # hermetic harness (sentinel key + SDK fakes) + smoke/scale/diagnose
-                       #   + a PyMuPDF-gated geometry test (synthetic vector PDF)
+  # next per the plan:  legend.py (M3), export.py + gui.py (M4)
+tests/                 # hermetic harness (sentinel key + SDK fakes) + smoke/scale/measure/
+                       #   diagnose + a PyMuPDF-gated geometry test (synthetic vector PDF)
 ```
 
 ## Licensing
