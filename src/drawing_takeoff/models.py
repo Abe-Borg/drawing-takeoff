@@ -1,0 +1,129 @@
+"""Dependency-free data models for the takeoff engine.
+
+These shapes carry geometry and text out of :mod:`drawing_takeoff.geometry`
+(the only PyMuPDF module) into the pure-Python measurement / scale / export
+layers. Nothing here imports PyMuPDF: coordinates are plain ``(x, y)`` float
+tuples, not ``fitz.Point``, so ``measure``/``scale``/``pipeline``/``export`` and
+the tests can manipulate geometry without the AGPL backend on the path.
+
+Only the shapes the current milestones need are defined. ``Run`` (M2),
+``TakeoffItem`` and ``TakeoffResult`` (M4) land with their milestones.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import NamedTuple
+
+# Rounding precision for the style-grouping key. Construction linework for one
+# system is drawn with a single pen, so colors/widths repeat to many decimals;
+# rounding collapses float jitter without merging genuinely distinct pens.
+_COLOR_NDIGITS = 3
+_WIDTH_NDIGITS = 2
+
+# A normalized path segment: a tuple whose first element is the op code
+# ("l", "c", "re", "qu") followed by plain coordinate tuples (never fitz types).
+Point = tuple[float, float]
+Segment = tuple  # ("l", p0, p1) | ("c", p0, p1, p2, p3) | ("re", bbox) | ("qu", ...)
+BBox = tuple[float, float, float, float]
+
+
+class SheetRef(NamedTuple):
+    """Identifies a source page (mirrors the sibling project's ``SheetRef``)."""
+
+    source: str        # PDF path or filename
+    page_index: int    # 0-based page index
+
+    def __str__(self) -> str:  # pragma: no cover - cosmetic
+        return f"{self.source}#p{self.page_index}"
+
+
+class StyleKey(NamedTuple):
+    """Hashable exact-style grouping key: ``(stroke_color, width, dashes)``.
+
+    The propagation mechanism for labeling: every path drawn with one pen
+    shares a key, so classifying one style labels all its paths. Build via
+    :meth:`from_path_attrs` so rounding is applied consistently.
+    """
+
+    stroke_color: tuple[float, ...] | None
+    width: float
+    dashes: str
+
+    @classmethod
+    def from_path_attrs(
+        cls,
+        stroke_color: tuple[float, ...] | None,
+        width: float | None,
+        dashes: str | None,
+    ) -> "StyleKey":
+        color = (
+            tuple(round(c, _COLOR_NDIGITS) for c in stroke_color)
+            if stroke_color is not None
+            else None
+        )
+        return cls(color, round(width or 0.0, _WIDTH_NDIGITS), dashes or "[] 0")
+
+
+@dataclass(frozen=True)
+class TextWord:
+    """One word from ``page.get_text("words")`` with its bbox."""
+
+    text: str
+    bbox: BBox
+
+    @property
+    def centroid(self) -> Point:
+        x0, y0, x1, y1 = self.bbox
+        return ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+
+
+@dataclass(frozen=True)
+class GeometryPath:
+    """One vector path from ``page.get_drawings()``, backend-free.
+
+    ``items`` are normalized segment tuples (see :data:`Segment`). ``kind`` is
+    ``"stroke"`` / ``"fill"`` / ``"both"`` (PyMuPDF ``s`` / ``f`` / ``fs``).
+    """
+
+    items: tuple[Segment, ...]
+    stroke_color: tuple[float, ...] | None
+    fill_color: tuple[float, ...] | None
+    width: float | None
+    dashes: str
+    closed: bool
+    bbox: BBox
+    kind: str
+
+    @property
+    def style_key(self) -> StyleKey:
+        return StyleKey.from_path_attrs(self.stroke_color, self.width, self.dashes)
+
+    @property
+    def bbox_width(self) -> float:
+        return self.bbox[2] - self.bbox[0]
+
+    @property
+    def bbox_height(self) -> float:
+        return self.bbox[3] - self.bbox[1]
+
+    @property
+    def is_degenerate(self) -> bool:
+        """A zero-extent path (the sheet's ~84k stipple artifacts) — drop it."""
+        return self.bbox_width <= 0.0 and self.bbox_height <= 0.0
+
+
+@dataclass
+class SheetGeometry:
+    """Everything measurement needs from one page, with no PyMuPDF on the path."""
+
+    ref: SheetRef
+    page_width_pt: float
+    page_height_pt: float
+    paths: list[GeometryPath] = field(default_factory=list)
+    words: list[TextWord] = field(default_factory=list)
+    scale_label: str | None = None
+    points_per_foot: float | None = None
+
+    def non_degenerate_paths(self) -> list[GeometryPath]:
+        """Paths with real extent (drops the zero-length stipple artifacts)."""
+        return [p for p in self.paths if not p.is_degenerate]
