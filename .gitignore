@@ -1,0 +1,50 @@
+# Byte-compiled / optimized / C extensions
+__pycache__/
+*.py[cod]
+*.so
+
+# Packaging / build artifacts
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+*.manifest
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test, coverage, and type-checker caches
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+
+# Project secrets and generated state — NEVER commit these.
+# Fallback API-key file; for a source install it can land in src/drawing_analyzer/.
+drawing_analyzer_api_key.txt
+# On-disk digest cache (default lives under the user config dir).
+drawing_digest_cache.json
+.env
+.env.*
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS cruft
+.DS_Store
+Thumbs.db

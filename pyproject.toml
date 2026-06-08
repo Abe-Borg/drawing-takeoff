@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "drawing-takeoff"
+version = "0.0.1"
+description = "Vector-geometry quantity takeoffs from construction-drawing PDFs (PyMuPDF geometry + Claude vision for labeling)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "AGPL-3.0-or-later" }
+dependencies = [
+    "anthropic>=0.97,<0.98",
+    "pymupdf",          # AGPL-3.0 — keep all usage isolated to geometry.py
+    "tiktoken",
+    "platformdirs",
+]
+
+[project.optional-dependencies]
+gui = ["customtkinter", "tkinterdnd2"]   # added at milestone M4
+dev = ["pytest>=9.0"]
+
+# Standalone GUI entry point — uncomment once gui.py exists (milestone M4).
+# [project.gui-scripts]
+# drawing-takeoff = "drawing_takeoff.gui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+pythonpath = ["src"]
+markers = [
+    "network: tests that require real Anthropic API access",
+]
