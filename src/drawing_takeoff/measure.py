@@ -94,8 +94,32 @@ def _straight_segments(paths: Iterable[GeometryPath], *, bezier_samples: int) ->
     return segs
 
 
-def _snap(p: Point, tol: float) -> tuple[float, float]:
-    return (round(p[0] / tol) * tol, round(p[1] / tol) * tol)
+class _NodeIndex:
+    """Assigns endpoints to merged nodes, snapping points within ``tol`` together.
+
+    A plain grid-round splits two points that lie within ``tol`` of each other
+    but straddle a cell boundary (e.g. ``0.24`` and ``0.26`` round to ``0.0`` and
+    ``0.5`` at ``tol=0.5``). This indexes points in ``tol``-sized cells and
+    searches the 3x3 neighborhood, so any two points within ``tol`` share a node
+    regardless of where the boundary falls — honoring the documented tolerance.
+    """
+
+    def __init__(self, tol: float) -> None:
+        self.tol = tol
+        self._cells: dict[tuple[int, int], list[tuple[Point, int]]] = defaultdict(list)
+        self._count = 0
+
+    def node_of(self, p: Point) -> int:
+        cx, cy = math.floor(p[0] / self.tol), math.floor(p[1] / self.tol)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for q, nid in self._cells.get((cx + dx, cy + dy), ()):
+                    if math.hypot(q[0] - p[0], q[1] - p[1]) <= self.tol:
+                        return nid
+        nid = self._count
+        self._count += 1
+        self._cells[(cx, cy)].append((p, nid))
+        return nid
 
 
 def _angle_mod180(a: Point, b: Point) -> float:
@@ -148,27 +172,34 @@ def stitch_runs(
     style_key = paths[0].style_key if paths else None
     raw = _straight_segments(paths, bezier_samples=bezier_samples)
 
-    # Dedup exact duplicates (orientation-independent) by snapped endpoints.
+    # Assign each endpoint a node id, merging points within `tol` (honoring the
+    # tolerance across grid boundaries — see _NodeIndex). Dedup exact-duplicate
+    # segments by their node-id pair so double-drawn lines don't inflate totals.
+    index = _NodeIndex(tol)
     seen: set = set()
     segs: list[tuple[Point, Point]] = []
+    seg_nodes: list[tuple[int, int]] = []
     for a, b in raw:
         if segment_length_pt(a, b) <= 0:
             continue
-        na, nb = _snap(a, tol), _snap(b, tol)
+        na, nb = index.node_of(a), index.node_of(b)
+        if na == nb:
+            continue  # endpoints within tol of each other -> a point, not a run
         key = (na, nb) if na <= nb else (nb, na)
         if key in seen:
             continue
         seen.add(key)
         segs.append((a, b))
+        seg_nodes.append((na, nb))
 
     if not segs:
         return []
 
     angles = [_angle_mod180(a, b) for a, b in segs]
-    node_segs: dict[tuple, list[int]] = defaultdict(list)
-    for i, (a, b) in enumerate(segs):
-        node_segs[_snap(a, tol)].append(i)
-        node_segs[_snap(b, tol)].append(i)
+    node_segs: dict[int, list[int]] = defaultdict(list)
+    for i, (na, nb) in enumerate(seg_nodes):
+        node_segs[na].append(i)
+        node_segs[nb].append(i)
 
     uf = _UnionFind(len(segs))
     for incident in node_segs.values():

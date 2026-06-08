@@ -90,6 +90,16 @@ def test_duplicate_segments_are_not_double_counted():
     assert runs[0].length_pt == pytest.approx(108.0)  # not 216
 
 
+def test_endpoint_tolerance_honored_across_snap_boundary():
+    # Shared endpoint jittered across a grid-rounding boundary: 40.24 vs 40.26
+    # are 0.02pt apart but a naive snap buckets them apart. They must still merge.
+    a = _line((10, 0), (40.24, 0))
+    b = _line((40.26, 0), (70, 0))
+    runs = measure.stitch_runs([a, b], tol=0.5)
+    assert len(runs) == 1
+    assert runs[0].length_pt == pytest.approx(59.98, abs=0.01)
+
+
 def test_near_but_not_collinear_does_not_merge():
     # 3 degrees apart, sharing an endpoint -> beyond the 2deg tol -> two runs
     import math
