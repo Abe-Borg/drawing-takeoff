@@ -261,3 +261,106 @@ def _parse_response(response, id_to_style: dict[str, StyleKey]) -> dict[StyleKey
                         reasoning="No label returned for this style."),
         )
     return out
+
+
+def _load_legend_image(path: str, page: int) -> bytes:
+    """Read a legend image, or rasterize a legend PDF page, to PNG bytes."""
+    if path.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+        with open(path, "rb") as fh:
+            return fh.read()
+    from .geometry import render_page_png
+
+    return render_page_png(path, page, dpi=150)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI: label a sheet's line styles and roll trusted ones up by system.
+
+    The first command that calls Claude — it needs ``ANTHROPIC_API_KEY``. The
+    legend lives on a separate lead sheet on most drawing sets, so pass it with
+    ``--legend`` (advisory); without it the model labels from the geometry stats
+    and rendered swatches alone.
+
+      python -m drawing_takeoff.legend SHEET.pdf [--legend LEAD.pdf] \\
+             [--discipline "fire protection"]
+    """
+    import argparse
+    import os
+    import sys
+    from collections import defaultdict
+
+    ap = argparse.ArgumentParser(description="M3 legend labeling (style -> system) via one Claude call.")
+    ap.add_argument("pdf")
+    ap.add_argument("--page", type=int, default=0)
+    ap.add_argument("--legend", default=None, help="lead-sheet PDF or image with the legend/symbols (advisory)")
+    ap.add_argument("--legend-page", type=int, default=0)
+    ap.add_argument("--discipline", default="construction", help='e.g. "fire protection", "plumbing", "HVAC"')
+    ap.add_argument("--max-styles", type=int, default=12)
+    args = ap.parse_args(argv)
+
+    if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
+        print("ANTHROPIC_API_KEY is not set — M3 is the LLM step and needs a key.", file=sys.stderr)
+        return 2
+
+    from . import measure
+    from .geometry import extract_pdf_geometry, render_style_swatch
+
+    geom = extract_pdf_geometry(args.pdf, pages=[args.page])[0]
+    ppf = geom.points_per_foot
+    cands = _candidates(geom, ppf=ppf, max_styles=args.max_styles)
+    if not cands:
+        print("No measurable line styles found on this sheet.")
+        return 0
+
+    swatches = {c.style_key: render_style_swatch(c.style_key) for c in cands}
+    legend_image = _load_legend_image(args.legend, args.legend_page) if args.legend else None
+
+    labels = label_styles(
+        geom,
+        ppf=ppf,
+        discipline=args.discipline,
+        style_images=swatches,
+        legend_image=legend_image,
+        max_styles=args.max_styles,
+    )
+    feet = measure.linear_feet_by_style(geom, ppf) if ppf else {}
+
+    print(f"=== M3 legend labels: {geom.ref.source} (page {geom.ref.page_index}) ===")
+    print(f"scale: {geom.scale_label or 'unknown'}" + (f"  ->  {ppf:g} pt/ft" if ppf else ""))
+    if args.legend:
+        print(f"legend image: {args.legend} (advisory)")
+    print("\nper-style labels:")
+    for c in cands:
+        lab = labels[c.style_key]
+        lf = feet.get(c.style_key)
+        lfs = f"{lf:,.0f} LF" if lf else "-"
+        flag = "  [AMBIGUOUS — review]" if lab.ambiguous else ""
+        print(f"  {c.style_id} {lfs:>10}  measurable={str(lab.measurable):5} {lab.confidence:>6} -> {lab.system}{flag}")
+        if lab.reasoning:
+            print(f"        {lab.reasoning}")
+
+    systems: dict[str, float] = defaultdict(float)
+    flagged = []
+    for c in cands:
+        lab = labels[c.style_key]
+        lf = feet.get(c.style_key, 0.0)
+        if lab.measurable and not lab.ambiguous:
+            systems[lab.system] += lf
+        elif lab.ambiguous:
+            flagged.append((c, lab, lf))
+
+    print("\nTAKEOFF by system (trusted, measurable styles):")
+    if systems:
+        for name, lf in sorted(systems.items(), key=lambda kv: -kv[1]):
+            print(f"  {name}: {lf:,.0f} LF")
+    else:
+        print("  (nothing confidently measurable — check the flagged styles)")
+    if flagged:
+        print("\nFLAGGED for your review (ambiguous — not counted):")
+        for c, lab, lf in flagged:
+            print(f"  {c.style_id} ({lf:,.0f} LF): {lab.system} — {lab.reasoning or ''}")
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

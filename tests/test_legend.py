@@ -118,6 +118,15 @@ def test_label_styles_passes_images_when_provided(geom):
     assert kinds.count("image") == 2  # swatch + legend image both attached
 
 
+def test_cli_requires_api_key(monkeypatch, capsys):
+    # The legend CLI is the LLM step — with no key it must bail before any work
+    # (no PDF read, no network), not crash.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")
+    rc = legend.main(["does-not-matter.pdf"])
+    assert rc == 2
+    assert "ANTHROPIC_API_KEY" in capsys.readouterr().err
+
+
 def test_label_styles_empty_geometry_returns_empty():
     empty = SheetGeometry(ref=SheetRef("x", 0), page_width_pt=10, page_height_pt=10, points_per_foot=9.0)
     # No client call should be needed when there are no candidate styles.
