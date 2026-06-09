@@ -1,8 +1,8 @@
 # Design draft: binding measurement to meaning (the bucketing layer)
 
-> **Status: M5 shipped; M6–M8 are design.** M5 (connectivity → networks) is implemented and
-> validated on the real sheets (§8); the rest is a plan to react to and poke holes in. Sections
-> 9–10 are the open questions and risks. It extends the shipped POC (M1–M4; see `README.md`) with the
+> **Status: M5–M6 shipped; M7–M8 are design.** M5 (connectivity → networks) and M6 (pipe sizes)
+> are implemented and validated on the real sheets (§8); the rest is a plan to react to and poke
+> holes in. Sections 9–10 are the open questions and risks. It extends the shipped POC (M1–M4; see `README.md`) with the
 > classification/bucketing layer the POC deliberately stubbed.
 
 ## 1. Context — the gap this closes
@@ -174,13 +174,20 @@ proxy that misses branch lineweights and can catch a matchline (FP2.21's two lar
 span 83–85% of the sheet and are auto-flagged). Connectivity stays robust to that; picking the
 true pipe styles is M7's job.
 
-### M6 — Tag harvesting + size-segmenting (NO LLM)
-**Objective:** harvest whatever size callouts exist and segment network footage by them — *tags
-are assumed sparse, so partial coverage is the expected outcome, not a failure.* **Build:** a
-size/system tag parser (extends `_length_tags`); snap tags to runs/networks (`nearest_run`
-exists); split network footage into size segments. **Exit:** where tags exist, `System × Size →
-LF` matches a hand check; everywhere else footage rolls up as an **unsized remainder** under its
-system — never dropped — and per-system totals stay exact regardless of tag coverage.
+### M6 — Pipe sizes (NO LLM) — VALIDATED & SHIPPED
+**Probe finding that reshaped it:** sizes here are *not* inch-marked — they're unicode fractions
+(`1¼`, `1½`) and bare numbers (`2`, `4`, `6`); `1'-0"` / `12-0` are *lengths*, not sizes. A naive
+`NN"` parser finds ~3 tags and concludes "no sizes"; the real notation is dense but inconsistent.
+**Result:** with a parser that snaps those forms to a fire-protection nominal set (¾"–8") and
+counts a token only when it's adjacent to a pipe run, coverage far beat the "sparse" assumption —
+FP2.20 **93% sized** (1½" 437 LF, 1¼" 298, 1" 268, 6" 179, 4" 78, 2" 53; 7% unsized), FP2.21
+**96% sized**. The split is a textbook sprinkler breakdown (1"–1½" branches + 2"/4"/6" mains).
+**Shipped (`measure.py`):** `parse_pipe_size_in` (unicode/ascii fractions, bare, inch-marked;
+rejects off-grid numbers and the `1/8"` scale), `size_tags`, `linear_feet_by_size` (per-run
+nearest-tag; **unsized remainder first-class**), `build_size_report` (+ `measure --sizes` CLI),
+and hermetic tests. **Caveat:** bare integers (`1`, `6`) are less certain than the unambiguous
+`1¼`/`1½` — a detail digit near a pipe could mis-size. The size-set + adjacency filter limits it,
+M7's LLM does the final normalization, and the per-network total stays exact regardless.
 
 ### M7 — LLM legend reconstruction (LLM enters, generalized M3)
 **Objective:** label networks/symbols from context, keyed on engine IDs, notation normalized.
@@ -221,7 +228,7 @@ Still open:
 |---|---|---|
 | Connectivity over/under-merges | networks span systems or shatter | endpoint-to-segment joins + scale-aware ~0.5 ft tol (M5, validated on real sheets); crossover disambiguation deferred; LLM `structure_edit` ops; overlay makes it visible |
 | Candidate pipe set contaminated | a matchline/non-pipe enters, or branch lineweights missed | M7 LLM picks the real pipe styles; M5 already flags networks spanning ~the whole sheet |
-| Size tags sparse (assumed) | most footage unsized | per-system **total** is the solid headline; `unsized remainder` is first-class; LLM-proposed size is advisory/flagged, never totaled |
+| Size mis-attributed (a bare-number tag near the wrong run) | a size segment is wrong | FP-size-set + adjacency filter (M6); unsized remainder first-class; M7 LLM normalizes; the per-network **total** is unaffected |
 | Too many networks for set-of-marks | unreadable overlay, poor grounding | hierarchical labeling (region → network); number only candidates |
 | LLM tempted to emit quantities | trust collapse | contract forbids numbers; tools own all math; aggregation ignores any number the model returns |
 | Symbols flattened inconsistently | counts unreliable | signature-hash + centroid dedup; fall back to vision count on the symbol crop, flagged |
