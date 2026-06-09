@@ -239,24 +239,90 @@ def stitch_runs(
     return runs
 
 
+# The sheet border / perimeter rule does two things a real run almost never
+# does together: it spans ~the whole sheet AND hugs a page edge (axis-aligned at
+# x~=0/W or y~=0/H). Testing span alone would wrongly drop a legitimate long main
+# that merely crosses the plan interior (a horizontal feed from x=100 to x=2700
+# on a 3024pt-wide sheet), so the edge requirement is what keeps real mains. The
+# test is geometric — not a length threshold (scale-dependent, drops long runs).
+_BORDER_SPAN_FRAC = 0.85
+_BORDER_EDGE_FRAC = 0.06
+
+
+def is_border_run(
+    run: Run,
+    page_width_pt: float,
+    page_height_pt: float,
+    *,
+    span_frac: float = _BORDER_SPAN_FRAC,
+    edge_frac: float = _BORDER_EDGE_FRAC,
+) -> bool:
+    """Whether ``run`` is a sheet border / perimeter rule.
+
+    A full-width, near-horizontal run hugging the top or bottom edge, or a
+    full-height, near-vertical run hugging the left or right edge. A long main
+    that crosses the plan interior (or a diagonal) spans wide but doesn't hug an
+    edge, so it is kept.
+    """
+    x0, y0, x1, y1 = run.bbox
+    w, h = x1 - x0, y1 - y0
+    mx, my = edge_frac * page_width_pt, edge_frac * page_height_pt
+    if w >= span_frac * page_width_pt and h <= my and (y0 <= my or y1 >= page_height_pt - my):
+        return True
+    if h >= span_frac * page_height_pt and w <= mx and (x0 <= mx or x1 >= page_width_pt - mx):
+        return True
+    return False
+
+
 def runs_by_style(
-    geometry: SheetGeometry, *, ppf: float | None = None, **kwargs
+    geometry: SheetGeometry,
+    *,
+    ppf: float | None = None,
+    exclude_border: bool = False,
+    span_frac: float = _BORDER_SPAN_FRAC,
+    **kwargs,
 ) -> dict[StyleKey, list[Run]]:
-    """Stitch every style's paths into runs. ``ppf`` defaults to the sheet's."""
+    """Stitch every style's paths into runs. ``ppf`` defaults to the sheet's.
+
+    With ``exclude_border``, runs that span ~the whole sheet (the border or a
+    matchline, per :func:`is_border_run`) are dropped so a sheet border never
+    poses as a measurable system — even one drawn in the pipe's own pen.
+    """
     if ppf is None:
         ppf = geometry.points_per_foot
     grouped = group_by_style(geometry.non_degenerate_paths())
-    return {k: stitch_runs(v, ppf=ppf, **kwargs) for k, v in grouped.items()}
+    out: dict[StyleKey, list[Run]] = {}
+    for k, paths in grouped.items():
+        runs = stitch_runs(paths, ppf=ppf, **kwargs)
+        if exclude_border:
+            runs = [
+                r
+                for r in runs
+                if not is_border_run(r, geometry.page_width_pt, geometry.page_height_pt, span_frac=span_frac)
+            ]
+        out[k] = runs
+    return out
 
 
-def linear_feet_by_style(geometry: SheetGeometry, ppf: float | None = None) -> dict[StyleKey, float]:
-    """Total linear feet per style (sum of stitched-run lengths / ppf)."""
+def linear_feet_by_style(
+    geometry: SheetGeometry,
+    ppf: float | None = None,
+    *,
+    exclude_border: bool = True,
+    span_frac: float = _BORDER_SPAN_FRAC,
+) -> dict[StyleKey, float]:
+    """Total linear feet per style (sum of stitched-run lengths / ppf).
+
+    ``exclude_border`` defaults to **True**: a takeoff total must never include
+    the sheet border or a matchline. Pass ``False`` for the raw geometry total.
+    """
     if ppf is None:
         ppf = geometry.points_per_foot
     if not ppf:
         raise ValueError("points_per_foot is required (sheet has no scale)")
     out: dict[StyleKey, float] = {}
-    for style, runs in runs_by_style(geometry, ppf=ppf).items():
+    runs_by = runs_by_style(geometry, ppf=ppf, exclude_border=exclude_border, span_frac=span_frac)
+    for style, runs in runs_by.items():
         total = sum(r.length_pt for r in runs) / ppf
         if total > 0:
             out[style] = total
@@ -283,11 +349,6 @@ def nearest_run(point: Point, runs: Sequence[Run], *, max_dist_pt: float | None 
 # ---------------------------------------------------------------------------
 # M2 report: per-style footage + validation against length tags
 # ---------------------------------------------------------------------------
-# A run longer than this is the sheet border / a matchline, not a pipe run; the
-# longest real pipe run on the sample sheets is ~30 ft (270 pt).
-_BORDER_RUN_PT = 500.0
-
-
 def _fmt_style(k: StyleKey) -> str:
     col = "none" if k.stroke_color is None else ",".join(f"{c:.2f}" for c in k.stroke_color)
     return f"[{col}] w={k.width} {k.dashes}"
@@ -327,7 +388,7 @@ def heaviest_dark_style(styles: Iterable[StyleKey]) -> StyleKey | None:
 
 
 def build_measure_report(
-    geometry: SheetGeometry, *, ppf: float | None = None, border_run_pt: float = _BORDER_RUN_PT
+    geometry: SheetGeometry, *, ppf: float | None = None, span_frac: float = _BORDER_SPAN_FRAC
 ) -> str:
     if ppf is None:
         ppf = geometry.points_per_foot
@@ -336,30 +397,39 @@ def build_measure_report(
         return "\n".join(lines + ["  no scale on sheet; cannot compute footage"])
     lines.append(f"scale: {geometry.scale_label!r} -> {ppf:.4g} pt/ft")
 
-    runs_by = runs_by_style(geometry, ppf=ppf)
-    rows = [(style, len(runs), sum(r.length_pt for r in runs) / ppf) for style, runs in runs_by.items()]
-    rows = [r for r in rows if r[2] > 0]
+    runs_by = runs_by_style(geometry, ppf=ppf)  # raw; border filtered per-style below
+    pw, ph = geometry.page_width_pt, geometry.page_height_pt
+
+    def _split(runs):
+        kept = [r for r in runs if not is_border_run(r, pw, ph, span_frac=span_frac)]
+        dropped = [r for r in runs if is_border_run(r, pw, ph, span_frac=span_frac)]
+        return kept, dropped
+
+    rows = []
+    for style, runs in runs_by.items():
+        kept, _dropped = _split(runs)
+        ft = sum(r.length_pt for r in kept) / ppf
+        if ft > 0:
+            rows.append((style, len(kept), ft))
     rows.sort(key=lambda r: -r[2])
 
     lines.append("")
-    lines.append(f"  {'per-style linear footage  [stroke_rgb] width dashes':52s} {'runs':>6s} {'total_ft':>11s}")
+    lines.append(f"  {'per-style linear footage, border excluded  [stroke_rgb] width dashes':62s} {'runs':>6s} {'total_ft':>11s}")
     for style, nruns, total_ft in rows[:12]:
-        lines.append(f"    {_fmt_style(style):50s} {nruns:6d} {total_ft:11,.1f}")
+        lines.append(f"    {_fmt_style(style):60s} {nruns:6d} {total_ft:11,.1f}")
 
     # Highlight the likely takeoff lineweight, picked INDEPENDENTLY of the tags
     # (heaviest dark pen) so the cross-check below isn't circular.
     pipe_style = heaviest_dark_style(runs_by.keys())
     if pipe_style is not None:
-        all_runs = runs_by[pipe_style]
-        pipe_runs = [r for r in all_runs if r.length_pt <= border_run_pt]
-        border_runs = [r for r in all_runs if r.length_pt > border_run_pt]
+        pipe_runs, border_runs = _split(runs_by[pipe_style])
         pipe_ft = sum(r.length_pt for r in pipe_runs) / ppf
         longest = max((r.length_pt / ppf for r in pipe_runs), default=0.0)
         lines += [
             "",
             f"  TAKEOFF lineweight (heaviest dark pen): {_fmt_style(pipe_style)}",
             f"    {len(pipe_runs)} runs, {pipe_ft:,.1f} LF  "
-            f"(dropped {len(border_runs)} run(s) > {border_run_pt:g}pt as border/matchline; "
+            f"(dropped {len(border_runs)} full-sheet-spanning run(s) as border/matchline; "
             f"longest kept run {longest:.1f} ft)",
         ]
         n_tags, tag_ft = length_tag_total(geometry)

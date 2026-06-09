@@ -174,3 +174,39 @@ def test_build_measure_report_cross_checks_against_tags():
 def test_build_measure_report_without_scale():
     geom = _sheet([_line((0, 0), (9, 0))], ppf=None)
     assert "no scale" in measure.build_measure_report(geom)
+
+
+# ---- border / matchline exclusion -----------------------------------------
+def test_is_border_run_spans_and_hugs_an_edge():
+    # page 3024x2160. The border spans the sheet AND hugs an edge.
+    edge = measure.stitch_runs([_line((0, 2160), (3024, 2160))], ppf=9.0)[0]  # bottom edge
+    assert measure.is_border_run(edge, 3024, 2160) is True
+    # a 62 ft riser in the interior (not full-span) is kept
+    riser = measure.stitch_runs([_line((900, 600), (900, 1162))], ppf=9.0)[0]
+    assert measure.is_border_run(riser, 3024, 2160) is False
+
+
+def test_interior_full_width_main_is_kept():
+    # a long main crossing 86% of the width but in the plan interior (not hugging
+    # the top/bottom edge) must NOT be classified as a border (Codex PR#7).
+    main = measure.stitch_runs([_line((100, 1000), (2700, 1000))], ppf=9.0)[0]
+    assert measure.is_border_run(main, 3024, 2160) is False
+    # a diagonal spanning the sheet is also kept (not axis-aligned at an edge)
+    diag = measure.stitch_runs([_line((100, 100), (2900, 2000))], ppf=9.0)[0]
+    assert measure.is_border_run(diag, 3024, 2160) is False
+
+
+def test_linear_feet_excludes_border_by_default():
+    # a full-width border (its own pen) + a 12 ft pipe run, on a real-size sheet
+    border = _line((0, 0), (3024, 0), stroke_color=(0.0, 0.0, 0.0), width=0.86)
+    pipe = _line((10, 100), (118, 100))  # 108 pt = 12 ft, black 1.3 (3.6% of width)
+    geom = SheetGeometry(
+        ref=SheetRef("x", 0), page_width_pt=3024, page_height_pt=2160,
+        paths=[border, pipe], points_per_foot=9.0,
+    )
+    feet = measure.linear_feet_by_style(geom, 9.0)          # exclude_border defaults True
+    assert max(feet.values()) < 150                         # the 336 ft border total is gone
+    assert any(abs(v - 12.0) < 0.5 for v in feet.values())  # the pipe run is kept
+
+    raw = measure.linear_feet_by_style(geom, 9.0, exclude_border=False)
+    assert max(raw.values()) > 300                          # raw still includes the 336 ft border

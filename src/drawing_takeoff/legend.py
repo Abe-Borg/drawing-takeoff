@@ -108,8 +108,12 @@ class _Candidate:
 
 
 def _candidates(geometry: SheetGeometry, *, ppf: float | None, max_styles: int) -> list[_Candidate]:
-    """The most takeoff-relevant styles, ranked by total measured length."""
-    runs_by_style = measure.runs_by_style(geometry, ppf=ppf)
+    """The most takeoff-relevant styles, ranked by total measured length.
+
+    Border/matchline runs are excluded so the sheet border never poses as a
+    candidate "main" and the per-style lengths shown to the model are honest.
+    """
+    runs_by_style = measure.runs_by_style(geometry, ppf=ppf, exclude_border=True)
     rows: list[_Candidate] = []
     for style, runs in runs_by_style.items():
         if not runs:
