@@ -22,18 +22,24 @@ def test_image_token_estimate_is_positive():
     assert est > 0
 
 
-def test_pipeline_stub_imports_cleanly():
-    """M0 exit criterion: the engine seam imports without its (future) deps.
-
-    The stub deliberately raises ``NotImplementedError`` — the real engine
-    lands at M4 — so this also pins that the entry point exists and stays
-    unimplemented until then.
-    """
+def test_pipeline_seam_handles_empty_input():
+    """The engine seam is implemented (M4): no PDFs -> an empty result, no error."""
     from drawing_takeoff import pipeline
+    from drawing_takeoff.models import TakeoffResult
 
-    assert callable(pipeline.extract_takeoff)
-    with pytest.raises(NotImplementedError):
-        pipeline.extract_takeoff([])
+    res = pipeline.extract_takeoff([])
+    assert isinstance(res, TakeoffResult)
+    assert res.sheet_count == 0 and res.items == [] and res.per_system_totals == {}
+
+
+def test_gui_module_imports_without_extras():
+    """The GUI imports without customtkinter/tkinterdnd2 (engine never needs them)."""
+    from drawing_takeoff import gui
+
+    assert callable(gui.main)
+    if not gui._GUI:  # extras absent in this env -> main bails with an install hint
+        with pytest.raises(SystemExit):
+            gui.main()
 
 
 def test_fake_client_injection_roundtrips():
