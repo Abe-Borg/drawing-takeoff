@@ -150,6 +150,21 @@ def render_style_swatch(style_key, *, width_px: int = 240, height_px: int = 48, 
     return data
 
 
+def image_file_to_png(path: str) -> bytes:
+    """Load a raster image file and re-encode it as PNG bytes.
+
+    Normalizes ``.jpg`` / ``.webp`` / ``.gif`` / ... so a legend image passed to
+    the recognition step is honestly labeled ``image/png`` (the request always
+    advertises PNG). PyMuPDF's PNG encoder only handles gray/RGB, so a CMYK scan
+    (common for legend sheets) is converted to RGB first — otherwise
+    ``tobytes("png")`` raises.
+    """
+    pix = fitz.Pixmap(path)
+    if pix.colorspace is not None and pix.colorspace.n not in (1, 3):
+        pix = fitz.Pixmap(fitz.csRGB, pix)
+    return pix.tobytes("png")
+
+
 def render_page_png(
     pdf_path: str,
     page_index: int = 0,

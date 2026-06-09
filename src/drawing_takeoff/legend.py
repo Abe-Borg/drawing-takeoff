@@ -264,12 +264,16 @@ def _parse_response(response, id_to_style: dict[str, StyleKey]) -> dict[StyleKey
 
 
 def _load_legend_image(path: str, page: int) -> bytes:
-    """Read a legend image, or rasterize a legend PDF page, to PNG bytes."""
-    if path.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
-        with open(path, "rb") as fh:
-            return fh.read()
-    from .geometry import render_page_png
+    """Read a legend image (any common raster) or rasterize a legend PDF page.
 
+    Always returns PNG bytes — the request advertises ``image/png`` for every
+    image block, so a ``.jpg``/``.webp`` legend must be re-encoded, not passed
+    through with a mislabeled media type.
+    """
+    from .geometry import image_file_to_png, render_page_png
+
+    if path.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff")):
+        return image_file_to_png(path)
     return render_page_png(path, page, dpi=150)
 
 
@@ -339,26 +343,40 @@ def main(argv: list[str] | None = None) -> int:
         if lab.reasoning:
             print(f"        {lab.reasoning}")
 
+    # Roll TRUSTED styles up by system (SystemLabel.trusted = measurable, not
+    # ambiguous, decent confidence); flag any measurable-but-not-trusted for
+    # review so a low-confidence style is never silently counted.
     systems: dict[str, float] = defaultdict(float)
     flagged = []
     for c in cands:
         lab = labels[c.style_key]
-        lf = feet.get(c.style_key, 0.0)
-        if lab.measurable and not lab.ambiguous:
-            systems[lab.system] += lf
-        elif lab.ambiguous:
+        lf = feet.get(c.style_key)
+        if lab.trusted:
+            systems[lab.system] += (lf or 0.0)
+        elif lab.measurable:
             flagged.append((c, lab, lf))
 
-    print("\nTAKEOFF by system (trusted, measurable styles):")
-    if systems:
-        for name, lf in sorted(systems.items(), key=lambda kv: -kv[1]):
-            print(f"  {name}: {lf:,.0f} LF")
+    if ppf:
+        print("\nTAKEOFF by system (trusted styles — measurable, not ambiguous, confident):")
+        if systems:
+            for name, lf in sorted(systems.items(), key=lambda kv: -kv[1]):
+                print(f"  {name}: {lf:,.0f} LF")
+        else:
+            print("  (nothing met the trust bar — see flagged styles)")
     else:
-        print("  (nothing confidently measurable — check the flagged styles)")
+        # No scale -> LF is unknowable; report that instead of a false "0 LF".
+        print("\nscale not detected — linear footage NOT computed (style labels above stand).")
+        if systems:
+            print("  trusted measurable systems:", ", ".join(sorted(systems)))
+
     if flagged:
-        print("\nFLAGGED for your review (ambiguous — not counted):")
+        print("\nFLAGGED for your review (measurable but ambiguous or low-confidence — NOT counted):")
         for c, lab, lf in flagged:
-            print(f"  {c.style_id} ({lf:,.0f} LF): {lab.system} — {lab.reasoning or ''}")
+            lfs = f"{lf:,.0f} LF" if lf else "LF n/a"
+            print(
+                f"  {c.style_id} ({lfs}): {lab.system} "
+                f"[conf={lab.confidence}, ambiguous={lab.ambiguous}] — {lab.reasoning or ''}"
+            )
     return 0
 
 
