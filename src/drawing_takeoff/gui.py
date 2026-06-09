@@ -37,12 +37,28 @@ except Exception:  # pragma: no cover - exercised only without the [gui] extra
 
 
 if _GUI:
+    # Drag-and-drop on a customtkinter root requires inheriting tkinterdnd2's
+    # DnDWrapper *and* loading the tkdnd Tcl package into the interpreter before
+    # any drop target is registered (see __init__). Fall back to a plain CTk
+    # root when the extra isn't present.
+    _APP_BASES = (ctk.CTk, TkinterDnD.DnDWrapper) if _DND else (ctk.CTk,)
 
-    class TakeoffApp(ctk.CTk):
+    class TakeoffApp(*_APP_BASES):
         """A small drag-drop -> takeoff-CSV window."""
 
         def __init__(self) -> None:
             super().__init__()
+            # Load tkdnd NOW, before registering any drop target — otherwise
+            # tkinterdnd2 raises 'invalid command name "tkdnd::drop_target"'.
+            # Best-effort: the window still opens (browse-only) if it can't load.
+            self._dnd = False
+            if _DND:
+                try:
+                    self.TkdndVersion = TkinterDnD._require(self)
+                    self._dnd = True
+                except Exception:
+                    self._dnd = False
+
             self.title("drawing-takeoff")
             self.geometry("760x640")
             self._pdfs: list[str] = []
@@ -70,9 +86,13 @@ if _GUI:
             ctk.CTkButton(top, text="Clear", width=70, command=self._clear).pack(side="right", padx=4)
             self._filebox = ctk.CTkTextbox(files, height=120)
             self._filebox.pack(fill="both", expand=True, pady=6)
-            if _DND:
-                self._filebox.drop_target_register(DND_FILES)
-                self._filebox.dnd_bind("<<Drop>>", self._on_drop)
+            if self._dnd:
+                # Register on the root window so a PDF dropped anywhere is accepted.
+                try:
+                    self.drop_target_register(DND_FILES)
+                    self.dnd_bind("<<Drop>>", self._on_drop)
+                except Exception:
+                    self._dnd = False
 
             # --- options ---------------------------------------------------
             opt = ctk.CTkFrame(self)
@@ -213,20 +233,9 @@ if _GUI:
             folder = export.write_takeoff_export(self._result, out, project_name="takeoff")
             messagebox.showinfo("drawing-takeoff", f"Saved to:\n{folder}")
 
-    def _make_root() -> "TakeoffApp":
-        # Enable drag-and-drop on the CTk root when tkinterdnd2 is present.
-        if _DND:
-            app = TakeoffApp()
-            try:
-                app.TkdndVersion = TkinterDnD._require(app)
-            except Exception:  # pragma: no cover - DnD is best-effort
-                pass
-            return app
-        return TakeoffApp()
-
     def main() -> int:
         ctk.set_appearance_mode("system")
-        _make_root().mainloop()
+        TakeoffApp().mainloop()
         return 0
 
 else:  # pragma: no cover - only when the [gui] extra is not installed
