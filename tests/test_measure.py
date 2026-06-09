@@ -174,3 +174,29 @@ def test_build_measure_report_cross_checks_against_tags():
 def test_build_measure_report_without_scale():
     geom = _sheet([_line((0, 0), (9, 0))], ppf=None)
     assert "no scale" in measure.build_measure_report(geom)
+
+
+# ---- border / matchline exclusion -----------------------------------------
+def test_is_border_run_by_page_span():
+    # page 3024x2160; a full-width run is the border, a long-but-not-spanning
+    # run (e.g. a 62 ft riser) is real and must be kept.
+    border = measure.stitch_runs([_line((0, 0), (3024, 0))], ppf=9.0)[0]   # spans 100% width
+    riser = measure.stitch_runs([_line((900, 600), (900, 1162))], ppf=9.0)[0]  # 562pt vertical, 26% height
+    assert measure.is_border_run(border, 3024, 2160) is True
+    assert measure.is_border_run(riser, 3024, 2160) is False  # 62 ft real run, kept
+
+
+def test_linear_feet_excludes_border_by_default():
+    # a full-width border (its own pen) + a 12 ft pipe run, on a real-size sheet
+    border = _line((0, 0), (3024, 0), stroke_color=(0.0, 0.0, 0.0), width=0.86)
+    pipe = _line((10, 100), (118, 100))  # 108 pt = 12 ft, black 1.3 (3.6% of width)
+    geom = SheetGeometry(
+        ref=SheetRef("x", 0), page_width_pt=3024, page_height_pt=2160,
+        paths=[border, pipe], points_per_foot=9.0,
+    )
+    feet = measure.linear_feet_by_style(geom, 9.0)          # exclude_border defaults True
+    assert max(feet.values()) < 150                         # the 336 ft border total is gone
+    assert any(abs(v - 12.0) < 0.5 for v in feet.values())  # the pipe run is kept
+
+    raw = measure.linear_feet_by_style(geom, 9.0, exclude_border=False)
+    assert max(raw.values()) > 300                          # raw still includes the 336 ft border
