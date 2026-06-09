@@ -2,7 +2,7 @@
 
 > **Status: draft for review — no code.** This is a paper design to react to and poke
 > holes in before any implementation. Sections 9–10 are the open questions and risks I most
-> want pressure-tested. It extends the shipped POC (`IMPLEMENTATION_PLAN.md`, M1–M4) with the
+> want pressure-tested. It extends the shipped POC (M1–M4; see `README.md`) with the
 > classification/bucketing layer the POC deliberately stubbed.
 
 ## 1. Context — the gap this closes
@@ -12,7 +12,7 @@ only by `StyleKey` — pen color + width + dashes — on the bet that *one pen =
 That bet is the thing we're now questioning. It is too coarse in three ways the user named:
 
 - **Blind to size.** 1″ and 2″ sprinkler pipe are the same system, often the same pen. Style
-  cannot separate them. (The original plan *intended* size — the M3 schema was
+  cannot separate them. (Size was *always* intended — the M3 schema was
   `{style_description, system_name, size, unit}`, outcome `Chilled Water Return, 6": 1,240.5 LF`
   — but it was dropped; `SystemLabel.size` is the unused vestige.)
 - **Conflates systems that share a pen**, and inversely **fragments one system drawn with
@@ -21,8 +21,9 @@ That bet is the thing we're now questioning. It is too coarse in three ways the 
   and a length-by-style pipeline has nowhere to put them.
 
 **Input reality (locked with the user):** always **vector** PDFs; true-to-scale; legends are
-often **absent, incomplete, or wrong**; different consultants use **different symbols/styles**
-for the same component. Assume an inconsistent mess.
+often **absent, incomplete, or wrong**; **size/system tags are sparse and inconsistent** (many
+runs carry no callout at all); different consultants use **different symbols/styles** for the
+same component. Assume an inconsistent mess.
 
 **What "always vector" buys us — and why this is tractable:** the two hard problems of a
 vision takeoff are *measurement* and *recall* (did we catch every run?). Vectors solve **both**:
@@ -123,9 +124,12 @@ The crux of the user's example, made concrete:
 2. **Size** comes from **tags distributed along the network** — because a single network reduces
    (4″ main → 2″ branch), the engine **splits the network's footage into size segments** by each
    run's nearest size tag. Size is a property of *segments*, system is a property of the *network*.
-3. **Untagged footage** → a **`size = unknown`** bucket under the right system, **flagged for
-   review** — never guessed. (Lineweight→size inference allowed *only* when a legend asserts it,
-   and then it's flagged, not trusted.)
+3. **Untagged footage** → an explicit **unsized remainder** under the right system. With tags
+   assumed sparse, *this is the common case, not an edge case*: the reliable headline is the
+   **per-system total LF**, and the size split is best-effort over whatever tags exist — unsized
+   footage is surfaced, never guessed or dropped. (The LLM may *propose* a size from visual
+   context or a legend's lineweight→size assertion, but only as an **advisory, flagged**
+   suggestion, never silently totaled.)
 4. **Symbols** → counts by component, separate table.
 5. Each bucket is **trusted** (confident, unambiguous) or **flagged**; only trusted rolls into
    headline totals, mirroring the current trust gate.
@@ -133,11 +137,12 @@ The crux of the user's example, made concrete:
 Worked shape:
 
 ```
-System                         Size      Qty     Unit   Basis
-Fire-protection sprinkler      2"      1,341.0   LF     tagged
-Fire-protection sprinkler      1"        612.5   LF     tagged
-Fire-protection sprinkler      unknown   ~88.0   LF     FLAG: no size tag on run
-Diffuser (supply)              —            47   EA     symbol S7 ×47
+System                         Size       Qty     Unit   Basis
+Fire-protection sprinkler      (total)  2,041.5   LF     network N3 — the solid headline
+Fire-protection sprinkler        2"       420.0   LF     tagged
+Fire-protection sprinkler        1"       180.5   LF     tagged
+Fire-protection sprinkler      unsized  1,441.0   LF     no callout on run — review / assume
+Diffuser (supply)              —             47   EA     symbol S7 ×47
 ```
 
 ## 7. Output & review
@@ -159,11 +164,13 @@ connected components; tee/junction handling; a `networks_report` like M2's. **Ex
 sheet, networks line up with the systems a human sees; tee-vs-crossover misgroupings are rare and
 visible.
 
-### M6 — Tag extraction + size-segmenting (NO LLM)
-**Objective:** turn the drawing's own callouts into size buckets. **Build:** a size/system tag
-parser (extends `_length_tags`); snap tags to runs/networks (`nearest_run` exists); split network
-footage into size segments. **Exit:** `System(known) × Size → LF` matches a hand check where tags
-exist; untagged footage surfaces as `unknown`, never dropped.
+### M6 — Tag harvesting + size-segmenting (NO LLM)
+**Objective:** harvest whatever size callouts exist and segment network footage by them — *tags
+are assumed sparse, so partial coverage is the expected outcome, not a failure.* **Build:** a
+size/system tag parser (extends `_length_tags`); snap tags to runs/networks (`nearest_run`
+exists); split network footage into size segments. **Exit:** where tags exist, `System × Size →
+LF` matches a hand check; everywhere else footage rolls up as an **unsized remainder** under its
+system — never dropped — and per-system totals stay exact regardless of tag coverage.
 
 ### M7 — LLM legend reconstruction (LLM enters, generalized M3)
 **Objective:** label networks/symbols from context, keyed on engine IDs, notation normalized.
@@ -177,30 +184,32 @@ optional agentic tools. **Exit:** correct system+component labels on the sample 
 overlay visually reconciles with the takeoff; relabel persists; hand-takeoff agreement within
 tolerance.
 
-## 9. Open questions to pressure-test (the point of this draft)
+## 9. Open questions to pressure-test
 
-1. **Tee vs. crossover.** When two pipes cross *without* connecting, how do your CAD sets draw it
-   — a gap/jog, a "hop," or nothing? This single fact drives the whole connectivity heuristic.
-   *Needs the real sheet.*
-2. **Are size tags reliably present and parseable?** How are they written (`2"Ø`, `2"`, `2 IN`,
-   leadered vs. inline)? If tags are sparse, the `unknown` bucket dominates and the value drops.
-3. **Set-of-marks legibility.** How many networks on a busy sheet? If it's hundreds, numbering is
+**Settled since this draft:** tee-vs-crossover disambiguation is **deferred** — we take it on
+later; M5 builds connectivity without it and tolerates the misgroupings it leaves. Size-tag
+density is **locked as sparse/inconsistent** (§1), so the *unsized remainder* is a first-class
+output, not an edge case to engineer away.
+
+Still open:
+
+1. **Set-of-marks legibility.** How many networks on a busy sheet? If it's hundreds, numbering is
    illegible and we need hierarchy (label regions → drill in) instead of a flat overlay.
-4. **One-shot vs. agentic.** Is the cost/latency of a tool-using loop worth the accuracy over a
+2. **One-shot vs. agentic.** Is the cost/latency of a tool-using loop worth the accuracy over a
    single structured call on the facts object? Likely sheet-dependent.
-5. **Cross-sheet identity.** Same system spans sheets — merge by LLM-supplied name, or by network
+3. **Cross-sheet identity.** Same system spans sheets — merge by LLM-supplied name, or by network
    continuity across matchlines? (M4 merges by system string today.)
-6. **Graph cuts at equipment.** A network can physically join two systems at a pump/tank. Where
+4. **Graph cuts at equipment.** A network can physically join two systems at a pump/tank. Where
    does the engine cut, and is that a `structure_edit` the LLM proposes, or an engine rule?
-7. **Reducers.** Size segmentation is ambiguous exactly at a reducer with no tag between two
-   tagged sizes — how to assign the transition footage.
+5. **Reducers.** Where two *tagged* sizes meet with no tag between them, how to assign the
+   transition footage (only relevant where tags actually exist).
 
 ## 10. Risks
 
 | Risk | If it bites | Design response |
 |---|---|---|
-| Connectivity mis-stitches (gaps/crossovers) | networks span systems or shatter | ε-tuning + tee rules (M5); LLM `structure_edit` ops; overlay makes it visible |
-| Size tags sparse/unparseable | `unknown` bucket dominates | honest `unknown` + flag; never guess; optional legend-asserted lineweight→size (flagged) |
+| Connectivity mis-stitches (gaps) | networks span systems or shatter | ε-tuning (M5; tee/crossover disambiguation deferred); LLM `structure_edit` ops; overlay makes it visible |
+| Size tags sparse (assumed) | most footage unsized | per-system **total** is the solid headline; `unsized remainder` is first-class; LLM-proposed size is advisory/flagged, never totaled |
 | Too many networks for set-of-marks | unreadable overlay, poor grounding | hierarchical labeling (region → network); number only candidates |
 | LLM tempted to emit quantities | trust collapse | contract forbids numbers; tools own all math; aggregation ignores any number the model returns |
 | Symbols flattened inconsistently | counts unreliable | signature-hash + centroid dedup; fall back to vision count on the symbol crop, flagged |
