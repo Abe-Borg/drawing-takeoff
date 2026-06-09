@@ -25,6 +25,11 @@ from .models import SheetGeometry, TakeoffItem, TakeoffResult
 
 __all__ = ["extract_takeoff"]
 
+# Upper bound on styles sent for labeling per sheet. High enough that all real
+# measured styles on a normal sheet are labeled (so footage is never dropped by
+# the cap); bounded so a pathological style explosion can't balloon the request.
+_MAX_LABELLED_STYLES = 40
+
 
 def _resolve_ppf(geom: SheetGeometry, scale_label: str | None) -> float | None:
     """Scale override (consistent across a set) wins over the sheet's own label."""
@@ -60,31 +65,41 @@ def takeoff_for_sheet(
     runs_by = measure.runs_by_style(geom, ppf=ppf, exclude_border=True)
     feet = {s: sum(r.length_pt for r in rs) / ppf for s, rs in runs_by.items() if rs}
 
-    # M3: name each style. The legend is advisory; ambiguous styles are flagged.
+    # M3: name EVERY measured style (cap high enough that footage is never
+    # silently dropped by the label limit). The legend is advisory; anything not
+    # *confidently* background is flagged for review, never guessed or discarded.
     labels = legend.label_styles(
-        geom, client=client, ppf=ppf, discipline=discipline, legend_image=legend_image
+        geom, client=client, ppf=ppf, discipline=discipline, legend_image=legend_image,
+        max_styles=min(max(len(feet), 1), _MAX_LABELLED_STYLES),
     )
+
+    def _item(style, lf, *, system, confidence, ambiguous, reasoning):
+        return TakeoffItem(
+            system=system, quantity=round(lf, 1), unit="LF", sheet=sheet_id,
+            style_key=style, scale_used=ppf, confidence=confidence, ambiguous=ambiguous,
+            run_count=len(runs_by.get(style, [])), reasoning=reasoning,
+        )
 
     items: list[TakeoffItem] = []
     for style, lf in sorted(feet.items(), key=lambda kv: -kv[1]):
         label = labels.get(style)
-        if label is None or not label.measurable:
-            continue  # background / text / symbol linework — never in the takeoff
-        items.append(
-            TakeoffItem(
-                system=label.system,
-                quantity=round(lf, 1),
-                unit="LF",
-                sheet=sheet_id,
-                style_key=style,
-                scale_used=ppf,
-                confidence=label.confidence,
-                ambiguous=label.ambiguous,
-                run_count=len(runs_by.get(style, [])),
-                reasoning=label.reasoning,
-            )
-        )
-    diagnostics.append(f"{sheet_id}: {len(items)} measurable system(s) of {len(feet)} styles")
+        if label is None:
+            # measured footage beyond the label cap — surface it, never drop.
+            items.append(_item(style, lf, system="(unlabeled style)", confidence="low",
+                               ambiguous=True, reasoning="measured but not labeled (beyond legend cap)"))
+        elif label.measurable:
+            items.append(_item(style, lf, system=label.system, confidence=label.confidence,
+                               ambiguous=label.ambiguous, reasoning=label.reasoning))
+        elif label.ambiguous:
+            # the model is unsure it's a run — flag the footage, don't drop it.
+            items.append(_item(style, lf, system=label.system or "(uncertain)",
+                               confidence=label.confidence, ambiguous=True, reasoning=label.reasoning))
+        # else: confidently non-measurable (background / text / symbols) — correctly excluded.
+
+    n_trusted = sum(1 for i in items if i.trusted)
+    diagnostics.append(
+        f"{sheet_id}: {n_trusted} trusted, {len(items) - n_trusted} flagged, of {len(feet)} measured styles"
+    )
     return items, diagnostics
 
 

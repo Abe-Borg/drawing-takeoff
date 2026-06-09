@@ -67,6 +67,44 @@ def test_takeoff_for_sheet_builds_named_items(geom):
     assert any("ppf=9" in d for d in diag)
 
 
+def test_uncertain_measured_style_is_flagged_not_dropped(geom):
+    # gray labeled NOT measurable but AMBIGUOUS -> its footage must surface as
+    # flagged, not silently disappear from the takeoff.
+    client = _client([
+        {"style_id": "s0", "system": "Pipe", "measurable": True, "confidence": "high",
+         "ambiguous": False, "reasoning": ""},
+        {"style_id": "s1", "system": "Possibly a branch", "measurable": False, "confidence": "low",
+         "ambiguous": True, "reasoning": "gray, unsure vs background"},
+    ])
+    items, _ = pipeline.takeoff_for_sheet(geom, client=client)
+    trusted = [i for i in items if i.trusted]
+    flagged = [i for i in items if not i.trusted]
+    assert any(i.system == "Pipe" for i in trusted)
+    assert any(i.quantity > 0 and i.system == "Possibly a branch" for i in flagged)
+
+
+def test_omitted_measured_style_is_flagged_not_dropped(geom):
+    # the model returns only s0; s1 has real footage but is omitted -> flagged.
+    client = _client([
+        {"style_id": "s0", "system": "Pipe", "measurable": True, "confidence": "high",
+         "ambiguous": False, "reasoning": ""},
+    ])
+    items, _ = pipeline.takeoff_for_sheet(geom, client=client)
+    assert any(i.quantity > 0 and not i.trusted for i in items)  # gray surfaced, not dropped
+
+
+def test_confident_background_is_excluded(geom):
+    # gray labeled NOT measurable and NOT ambiguous -> correctly excluded (not flagged).
+    client = _client([
+        {"style_id": "s0", "system": "Pipe", "measurable": True, "confidence": "high",
+         "ambiguous": False, "reasoning": ""},
+        {"style_id": "s1", "system": "Architectural background", "measurable": False,
+         "confidence": "high", "ambiguous": False, "reasoning": "gray background"},
+    ])
+    items, _ = pipeline.takeoff_for_sheet(geom, client=client)
+    assert len(items) == 1 and items[0].system == "Pipe"
+
+
 def test_takeoff_for_sheet_requires_scale(geom):
     geom.points_per_foot = None
     geom.scale_label = None
