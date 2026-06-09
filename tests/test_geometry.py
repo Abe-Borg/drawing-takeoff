@@ -93,3 +93,12 @@ def test_render_style_swatch_produces_png():
 def test_render_page_png(synthetic_pdf):
     png = geometry.render_page_png(synthetic_pdf, 0, dpi=72)
     assert png[:8] == _PNG_MAGIC
+
+
+def test_image_file_to_png_normalizes(tmp_path):
+    from drawing_takeoff.models import StyleKey
+
+    # write a raster image to disk, then re-encode it through the normalizer
+    src = tmp_path / "swatch.png"
+    src.write_bytes(geometry.render_style_swatch(StyleKey.from_path_attrs((0.0, 0.0, 0.0), 1.0, "[] 0")))
+    assert geometry.image_file_to_png(str(src))[:8] == _PNG_MAGIC

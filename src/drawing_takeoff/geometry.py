@@ -150,6 +150,16 @@ def render_style_swatch(style_key, *, width_px: int = 240, height_px: int = 48, 
     return data
 
 
+def image_file_to_png(path: str) -> bytes:
+    """Load a raster image file and re-encode it as PNG bytes.
+
+    Normalizes ``.jpg`` / ``.webp`` / ``.gif`` / ... so a legend image passed to
+    the recognition step is honestly labeled ``image/png`` (the request always
+    advertises PNG).
+    """
+    return fitz.Pixmap(path).tobytes("png")
+
+
 def render_page_png(
     pdf_path: str,
     page_index: int = 0,
