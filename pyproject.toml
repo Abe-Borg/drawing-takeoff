@@ -20,9 +20,9 @@ dependencies = [
 gui = ["customtkinter", "tkinterdnd2"]   # added at milestone M4
 dev = ["pytest>=9.0"]
 
-# Standalone GUI entry point — uncomment once gui.py exists (milestone M4).
-# [project.gui-scripts]
-# drawing-takeoff = "drawing_takeoff.gui:main"
+# Standalone GUI entry point (milestone M4). Needs the [gui] extra.
+[project.gui-scripts]
+drawing-takeoff = "drawing_takeoff.gui:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

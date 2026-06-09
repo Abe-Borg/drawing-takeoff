@@ -5,10 +5,10 @@ PDFs. Measurement runs on exact PyMuPDF **vector geometry** (resolution-independ
 sheet, in PDF points); Claude vision is used **surgically** — read the legend once, then
 propagate system labels to every same-styled line by exact style match.
 
-> **Status: M2 (linear measurement) ships.** Vendored `core/` infra plus the backend-free
-> engine — `geometry.py` (the only PyMuPDF module), `models.py`, `scale.py`, `measure.py`
-> (run stitching + per-style footage), and `diagnose`/`measure` reports. Legend labeling
-> (M3) and the GUI/CSV pipeline (M4) are next. See **`IMPLEMENTATION_PLAN.md`** for the
+> **Status: end-to-end POC (M1–M4).** Drop in a set of vector sheets → a takeoff CSV grouped
+> by system. Geometry + scale (M1), border-aware run stitching + per-style footage (M2),
+> legend labeling via one Claude tool-use call (M3), and the `extract_takeoff` pipeline +
+> CSV export + drag-drop GUI (M4) all ship. See **`IMPLEMENTATION_PLAN.md`** for the
 > milestone plan and **`KICKOFF.md`** for the handoff.
 
 ## Install & test
@@ -19,19 +19,32 @@ pip install -e ".[dev]"      # engine deps + pytest
 pytest                       # the smoke tests should be green
 ```
 
-The `[gui]` extra (customtkinter, tkinterdnd2) is added at milestone M4.
+## Run a takeoff
 
-Run the M1 go/no-go diagnostic on a vector sheet (cleanliness / instances / scale):
+The legend/labeling and full pipeline call Claude, so set `ANTHROPIC_API_KEY` first.
 
 ```bash
-python -m drawing_takeoff.diagnose path/to/sheet.pdf [--out report.txt]
+# Name each lineweight's system and roll up trusted styles into a named takeoff:
+python -m drawing_takeoff.legend  SHEET.pdf [--legend LEAD_SHEET.pdf] [--discipline "fire protection"]
+
+# The GUI: drag in a set, confirm the scale, run, save the CSV
+pip install -e ".[gui]"      # customtkinter + tkinterdnd2
+python -m drawing_takeoff.gui
 ```
 
-Run the M2 linear-measurement report (per-style footage + total, cross-checked against any
-dimension callouts on the sheet):
+Headless, the engine is one call — PDFs in, a `TakeoffResult` out (per-system totals,
+flagged styles, per-sheet errors), with `export.write_takeoff_export(...)` for the CSVs:
+
+```python
+from drawing_takeoff.pipeline import extract_takeoff
+result = extract_takeoff(["FP2.20.pdf", "FP2.21.pdf"], discipline="fire protection")
+```
+
+### No-LLM reports (geometry only)
 
 ```bash
-python -m drawing_takeoff.measure path/to/sheet.pdf [--out report.txt]
+python -m drawing_takeoff.diagnose SHEET.pdf   # M1 go/no-go: cleanliness / instances / scale
+python -m drawing_takeoff.measure  SHEET.pdf   # M2: per-style footage, border-excluded, cross-checked
 ```
 
 ## Scale (the simplifying assumption)
@@ -52,8 +65,10 @@ src/drawing_takeoff/
   scale.py             # M1: scale-label -> points_per_foot; dimension verifier
   diagnose.py          # M1: go/no-go diagnostic report (pure; runs on models)
   measure.py           # M2: length primitives, run stitching, per-style footage
-  pipeline.py          # M0 stub: extract_takeoff seam (implemented at M4)
-  # next per the plan:  legend.py (M3), export.py + gui.py (M4)
+  legend.py            # M3: legend labeling via one Claude tool-use call (style -> system)
+  pipeline.py          # M4: extract_takeoff — geometry -> measure -> legend -> totals
+  export.py            # M4: takeoff CSV + diagnostics (pure builders + file writer)
+  gui.py               # M4: drag-drop front-end over extract_takeoff (needs [gui])
 tests/                 # hermetic harness (sentinel key + SDK fakes) + smoke/scale/measure/
                        #   diagnose + a PyMuPDF-gated geometry test (synthetic vector PDF)
 ```

@@ -176,3 +176,50 @@ class SystemLabel:
     def trusted(self) -> bool:
         """Safe to auto-total: a measurable run, not ambiguous, decent confidence."""
         return self.measurable and not self.ambiguous and self.confidence in ("high", "medium")
+
+
+@dataclass(frozen=True)
+class TakeoffItem:
+    """One measured, named quantity for the takeoff — a style's footage on a sheet."""
+
+    system: str
+    quantity: float
+    unit: str                  # "LF" for linear length
+    sheet: str                 # "<source>#p<page>"
+    style_key: StyleKey
+    scale_used: float          # points_per_foot the measurement used
+    confidence: str = "low"    # carried from the legend label
+    ambiguous: bool = False
+    run_count: int = 0         # provenance: how many stitched runs
+    reasoning: str | None = None
+
+    @property
+    def trusted(self) -> bool:
+        """Counts toward an automatic total (not ambiguous, decent confidence)."""
+        return not self.ambiguous and self.confidence in ("high", "medium")
+
+
+@dataclass
+class TakeoffResult:
+    """The end-to-end takeoff: per-sheet items, cross-sheet totals, and notes.
+
+    ``per_system_totals`` sums only :attr:`TakeoffItem.trusted` items across all
+    sheets; ambiguous styles surface via :attr:`flagged` for human review rather
+    than being silently counted. ``errors`` captures per-sheet failures so one
+    bad sheet never sinks the run; ``diagnostics`` is a human-readable trail.
+    """
+
+    items: list[TakeoffItem] = field(default_factory=list)
+    per_system_totals: dict[str, float] = field(default_factory=dict)
+    sheet_count: int = 0
+    errors: list[str] = field(default_factory=list)
+    diagnostics: list[str] = field(default_factory=list)
+
+    @property
+    def trusted_items(self) -> list[TakeoffItem]:
+        return [i for i in self.items if i.trusted]
+
+    @property
+    def flagged(self) -> list[TakeoffItem]:
+        """Measurable but not trusted — surfaced for confirmation, not counted."""
+        return [i for i in self.items if not i.trusted]
