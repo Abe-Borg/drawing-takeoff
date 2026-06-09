@@ -239,22 +239,39 @@ def stitch_runs(
     return runs
 
 
-# The sheet border and matchlines span (essentially) the full sheet; a real
-# pipe/duct/wall run almost never does — even a 62 ft riser is only ~25% of a
-# 42x30 sheet. So "is this the border?" is a GEOMETRIC question — does the run
-# span >= this fraction of the page width or height — not a length threshold
-# (which is scale-dependent and wrongly drops a long real run). This keeps a
-# sheet border out of every total even when it's drawn in the pipe's own pen.
+# The sheet border / perimeter rule does two things a real run almost never
+# does together: it spans ~the whole sheet AND hugs a page edge (axis-aligned at
+# x~=0/W or y~=0/H). Testing span alone would wrongly drop a legitimate long main
+# that merely crosses the plan interior (a horizontal feed from x=100 to x=2700
+# on a 3024pt-wide sheet), so the edge requirement is what keeps real mains. The
+# test is geometric — not a length threshold (scale-dependent, drops long runs).
 _BORDER_SPAN_FRAC = 0.85
+_BORDER_EDGE_FRAC = 0.06
 
 
 def is_border_run(
-    run: Run, page_width_pt: float, page_height_pt: float, *, span_frac: float = _BORDER_SPAN_FRAC
+    run: Run,
+    page_width_pt: float,
+    page_height_pt: float,
+    *,
+    span_frac: float = _BORDER_SPAN_FRAC,
+    edge_frac: float = _BORDER_EDGE_FRAC,
 ) -> bool:
-    """Whether ``run`` is a sheet border / matchline (spans ~the whole sheet)."""
-    w = run.bbox[2] - run.bbox[0]
-    h = run.bbox[3] - run.bbox[1]
-    return w >= span_frac * page_width_pt or h >= span_frac * page_height_pt
+    """Whether ``run`` is a sheet border / perimeter rule.
+
+    A full-width, near-horizontal run hugging the top or bottom edge, or a
+    full-height, near-vertical run hugging the left or right edge. A long main
+    that crosses the plan interior (or a diagonal) spans wide but doesn't hug an
+    edge, so it is kept.
+    """
+    x0, y0, x1, y1 = run.bbox
+    w, h = x1 - x0, y1 - y0
+    mx, my = edge_frac * page_width_pt, edge_frac * page_height_pt
+    if w >= span_frac * page_width_pt and h <= my and (y0 <= my or y1 >= page_height_pt - my):
+        return True
+    if h >= span_frac * page_height_pt and w <= mx and (x0 <= mx or x1 >= page_width_pt - mx):
+        return True
+    return False
 
 
 def runs_by_style(

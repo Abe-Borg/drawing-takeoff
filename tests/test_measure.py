@@ -177,13 +177,23 @@ def test_build_measure_report_without_scale():
 
 
 # ---- border / matchline exclusion -----------------------------------------
-def test_is_border_run_by_page_span():
-    # page 3024x2160; a full-width run is the border, a long-but-not-spanning
-    # run (e.g. a 62 ft riser) is real and must be kept.
-    border = measure.stitch_runs([_line((0, 0), (3024, 0))], ppf=9.0)[0]   # spans 100% width
-    riser = measure.stitch_runs([_line((900, 600), (900, 1162))], ppf=9.0)[0]  # 562pt vertical, 26% height
-    assert measure.is_border_run(border, 3024, 2160) is True
-    assert measure.is_border_run(riser, 3024, 2160) is False  # 62 ft real run, kept
+def test_is_border_run_spans_and_hugs_an_edge():
+    # page 3024x2160. The border spans the sheet AND hugs an edge.
+    edge = measure.stitch_runs([_line((0, 2160), (3024, 2160))], ppf=9.0)[0]  # bottom edge
+    assert measure.is_border_run(edge, 3024, 2160) is True
+    # a 62 ft riser in the interior (not full-span) is kept
+    riser = measure.stitch_runs([_line((900, 600), (900, 1162))], ppf=9.0)[0]
+    assert measure.is_border_run(riser, 3024, 2160) is False
+
+
+def test_interior_full_width_main_is_kept():
+    # a long main crossing 86% of the width but in the plan interior (not hugging
+    # the top/bottom edge) must NOT be classified as a border (Codex PR#7).
+    main = measure.stitch_runs([_line((100, 1000), (2700, 1000))], ppf=9.0)[0]
+    assert measure.is_border_run(main, 3024, 2160) is False
+    # a diagonal spanning the sheet is also kept (not axis-aligned at an edge)
+    diag = measure.stitch_runs([_line((100, 100), (2900, 2000))], ppf=9.0)[0]
+    assert measure.is_border_run(diag, 3024, 2160) is False
 
 
 def test_linear_feet_excludes_border_by_default():
