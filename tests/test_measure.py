@@ -210,3 +210,74 @@ def test_linear_feet_excludes_border_by_default():
 
     raw = measure.linear_feet_by_style(geom, 9.0, exclude_border=False)
     assert max(raw.values()) > 300                          # raw still includes the 336 ft border
+
+
+# ---- M5 network connectivity ----------------------------------------------
+def _runs(*segments, ppf=9.0):
+    """One stitched Run per (p0, p1) segment — the input shape ``networks`` takes."""
+    out = []
+    for p0, p1 in segments:
+        out.extend(measure.stitch_runs([_line(p0, p1)], ppf=ppf))
+    return out
+
+
+def test_networks_join_a_branch_teeing_into_a_main():
+    # a branch whose endpoint lands on the MIDDLE of the main must join it: this
+    # is the endpoint-to-SEGMENT case endpoint-only connectivity misses.
+    main = measure.stitch_runs([_line((0, 0), (200, 0))], ppf=9.0)
+    branch = measure.stitch_runs([_line((100, 0), (100, 60))], ppf=9.0)
+    nets = measure.networks(main + branch, ppf=9.0)
+    assert len(nets) == 1
+    assert nets[0].run_count == 2
+    assert nets[0].length_ft == pytest.approx((200 + 60) / 9.0)
+    assert nets[0].id == "N0"
+
+
+def test_networks_separate_disjoint_systems():
+    far = _runs(((0, 0), (100, 0)), ((0, 500), (100, 500)))  # 500 pt apart, well beyond tol
+    nets = measure.networks(far, ppf=9.0)
+    assert len(nets) == 2
+    assert all(nw.run_count == 1 for nw in nets)
+
+
+def test_networks_bridge_a_fitting_gap_within_tolerance():
+    # two collinear runs with a 3 pt break (pipe broken at a fitting): 0.5 ft tol
+    # (= 4.5 pt at 9 pt/ft) bridges it; a 30 pt gap stays two networks.
+    a = measure.stitch_runs([_line((0, 0), (100, 0))], ppf=9.0)
+    near = measure.stitch_runs([_line((103, 0), (200, 0))], ppf=9.0)
+    assert len(measure.networks(a + near, ppf=9.0, tol_ft=0.5)) == 1
+    far = measure.stitch_runs([_line((130, 0), (200, 0))], ppf=9.0)
+    assert len(measure.networks(a + far, ppf=9.0, tol_ft=0.5)) == 2
+
+
+def test_networks_do_not_merge_a_crossover():
+    # a horizontal and a vertical run cross at (50, 0) but NEITHER has an endpoint
+    # there -> not connected. This is the crossover-safety the ~0.5 ft tol relies on.
+    horiz = measure.stitch_runs([_line((0, 0), (100, 0))], ppf=9.0)
+    vert = measure.stitch_runs([_line((50, -50), (50, 50))], ppf=9.0)
+    assert len(measure.networks(horiz + vert, ppf=9.0, tol_ft=0.5)) == 2
+
+
+def test_networks_sorted_largest_first():
+    nets = measure.networks(_runs(((0, 0), (50, 0)), ((0, 100), (300, 100))), ppf=9.0)
+    assert [nw.id for nw in nets] == ["N0", "N1"]
+    assert nets[0].length_pt > nets[1].length_pt
+    assert nets[0].style_keys  # a network exposes the styles it spans
+
+
+def test_build_networks_report_reports_a_connected_system():
+    # main + branch in the pipe pen on a real-size, scaled sheet -> one network
+    paths = [_line((100, 100), (1000, 100)), _line((500, 100), (500, 400))]
+    geom = SheetGeometry(
+        ref=SheetRef("x", 0), page_width_pt=3024, page_height_pt=2160,
+        paths=paths, points_per_foot=9.0, scale_label='1/8" = 1\'-0"',
+    )
+    report = measure.build_networks_report(geom)
+    assert "M5 networks" in report
+    assert "1 network(s)" in report
+    assert "N0" in report
+
+
+def test_build_networks_report_without_scale():
+    geom = _sheet([_line((0, 0), (9, 0))], ppf=None)
+    assert "no scale" in measure.build_networks_report(geom)

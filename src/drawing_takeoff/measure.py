@@ -24,11 +24,12 @@ from collections import defaultdict
 from typing import Iterable, Sequence
 
 from . import scale as _scale
-from .models import BBox, GeometryPath, Point, Run, SheetGeometry, StyleKey
+from .models import BBox, GeometryPath, Network, Point, Run, SheetGeometry, StyleKey
 
 _BEZIER_SAMPLES = 16
 _DEFAULT_TOL = 0.5          # pt: endpoints within this snap to one node
 _DEFAULT_ANGLE_TOL = 2.0    # deg: segments within this of each other are collinear
+_DEFAULT_NETWORK_TOL_FT = 0.5  # ft: scale-aware gap bridge for network connectivity (M5 probe)
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +331,96 @@ def linear_feet_by_style(
 
 
 # ---------------------------------------------------------------------------
+# network connectivity (M5): runs -> connected systems ("follow the line")
+# ---------------------------------------------------------------------------
+def _point_segment_dist(p: Point, a: Point, b: Point) -> float:
+    """Shortest distance from point ``p`` to segment ``ab`` (clamped to the ends)."""
+    abx, aby = b[0] - a[0], b[1] - a[1]
+    seg2 = abx * abx + aby * aby
+    if seg2 <= 0.0:
+        return math.hypot(p[0] - a[0], p[1] - a[1])
+    t = ((p[0] - a[0]) * abx + (p[1] - a[1]) * aby) / seg2
+    t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t
+    return math.hypot(p[0] - (a[0] + t * abx), p[1] - (a[1] + t * aby))
+
+
+def _run_segments(run: Run) -> list[tuple[Point, Point]]:
+    pl = run.polyline
+    return [(pl[i], pl[i + 1]) for i in range(len(pl) - 1)]
+
+
+def connect_runs(runs: Sequence[Run], *, tol: float) -> list[list[int]]:
+    """Group run indices into connected components ("networks").
+
+    Two runs join when an **endpoint of one lands within ``tol`` of any segment
+    of the other** — a tee, an elbow, or a small gap at a fitting. Endpoint-to-
+    *segment* (not just shared endpoints) is the crux the M5 probe proved: a
+    branch tees into the *middle* of a main, so endpoint-only connectivity
+    shatters a physically-connected system. ``tol`` is a scale-aware gap bridge
+    (see :func:`networks`); a true crossover carries no endpoint at the crossing,
+    so a modest ``tol`` does not merge the two lines that cross there.
+
+    Segments are indexed into a ``tol``-sized grid and each endpoint probes only
+    its 3x3 cell neighborhood, so the pass is near-linear, not O(n^2).
+    """
+    n = len(runs)
+    if n == 0:
+        return []
+    cell = max(tol, _DEFAULT_TOL)
+    grid: dict[tuple[int, int], list[tuple[int, Point, Point]]] = defaultdict(list)
+    for i, r in enumerate(runs):
+        for a, b in _run_segments(r):
+            cx0, cx1 = sorted((math.floor(a[0] / cell), math.floor(b[0] / cell)))
+            cy0, cy1 = sorted((math.floor(a[1] / cell), math.floor(b[1] / cell)))
+            for cx in range(cx0, cx1 + 1):
+                for cy in range(cy0, cy1 + 1):
+                    grid[(cx, cy)].append((i, a, b))
+
+    uf = _UnionFind(n)
+    for i, r in enumerate(runs):
+        for p in (r.polyline[0], r.polyline[-1]):
+            cx, cy = math.floor(p[0] / cell), math.floor(p[1] / cell)
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for j, a, b in grid.get((cx + dx, cy + dy), ()):
+                        if j == i or uf.find(i) == uf.find(j):
+                            continue
+                        if _point_segment_dist(p, a, b) <= tol:
+                            uf.union(i, j)
+
+    comps: dict[int, list[int]] = defaultdict(list)
+    for i in range(n):
+        comps[uf.find(i)].append(i)
+    return list(comps.values())
+
+
+def networks(
+    runs: Sequence[Run],
+    *,
+    ppf: float | None = None,
+    tol_ft: float = _DEFAULT_NETWORK_TOL_FT,
+    tol_pt: float | None = None,
+) -> list[Network]:
+    """Connect ``runs`` into :class:`Network` s, largest (by length) first.
+
+    The tolerance is **scale-aware**: ``tol_ft`` feet via ``ppf`` (the M5 probe
+    put the sweet spot near 0.5 ft — wide enough to bridge the breaks pipe picks
+    up at fittings, tight enough that true crossovers don't merge). Pass
+    ``tol_pt`` to override in raw points (e.g. when no scale is known). ``runs``
+    is whatever candidate set the caller trusts as one discipline's linework;
+    connecting across mixed styles is intended (a system may span lineweights).
+    """
+    if tol_pt is None:
+        tol_pt = tol_ft * ppf if ppf else _DEFAULT_TOL
+    comps = connect_runs(runs, tol=tol_pt)
+    comps.sort(key=lambda c: -sum(runs[k].length_pt for k in c))
+    return [
+        Network(id=f"N{i}", runs=tuple(runs[k] for k in comp), ppf=ppf)
+        for i, comp in enumerate(comps)
+    ]
+
+
+# ---------------------------------------------------------------------------
 # text <-> run association (the bridge from a label to the run it tags)
 # ---------------------------------------------------------------------------
 def nearest_run(point: Point, runs: Sequence[Run], *, max_dist_pt: float | None = None) -> Run | None:
@@ -442,12 +533,68 @@ def build_measure_report(
     return "\n".join(lines)
 
 
+def build_networks_report(
+    geometry: SheetGeometry,
+    *,
+    ppf: float | None = None,
+    tol_ft: float = _DEFAULT_NETWORK_TOL_FT,
+) -> str:
+    """M5 report: connect the candidate (heaviest-dark) linework into networks.
+
+    A connected system concentrates its footage in a few networks; a flat spread
+    of singletons means connectivity isn't catching the tees/gaps. The candidate
+    set is the no-LLM heaviest-dark heuristic — a rough proxy (it can miss branch
+    lineweights or catch a matchline), but enough to gate whether connectivity
+    holds. A network spanning ~the whole sheet is flagged as a likely matchline.
+    """
+    if ppf is None:
+        ppf = geometry.points_per_foot
+    lines = [f"=== M5 networks: {geometry.ref.source} (page {geometry.ref.page_index}) ==="]
+    if not ppf:
+        return "\n".join(lines + ["  no scale on sheet; cannot compute footage"])
+
+    runs_by = runs_by_style(geometry, ppf=ppf, exclude_border=True)
+    pipe_style = heaviest_dark_style(runs_by.keys())
+    pipe = runs_by.get(pipe_style, []) if pipe_style is not None else []
+    if not pipe:
+        return "\n".join(lines + ["  no candidate (heaviest-dark) linework found"])
+
+    nets = networks(pipe, ppf=ppf, tol_ft=tol_ft)
+    total_ft = sum(r.length_pt for r in pipe) / ppf
+    pw, ph = geometry.page_width_pt, geometry.page_height_pt
+    lines += [
+        f"scale: {geometry.scale_label!r} -> {ppf:.4g} pt/ft   "
+        f"tolerance: {tol_ft:g} ft ({tol_ft * ppf:.1f} pt)",
+        f"candidate lineweight (heaviest dark pen): {_fmt_style(pipe_style)}",
+        f"  {len(pipe)} runs, {total_ft:,.1f} LF  ->  {len(nets)} network(s)",
+        "",
+        f"  {'top networks  (one network = one connected system)':52s} {'runs':>5s} {'LF':>10s} {'%page':>7s}",
+    ]
+    for nw in nets[:12]:
+        x0, y0, x1, y1 = nw.bbox
+        pgpct = 100.0 * max((x1 - x0) / pw, (y1 - y0) / ph)
+        flag = "  <- spans the sheet (matchline / non-pipe?)" if pgpct >= 80.0 else ""
+        lines.append(f"    {nw.id:52s} {nw.run_count:5d} {nw.length_ft:10,.1f} {pgpct:6.0f}%{flag}")
+    top3 = sum(nw.length_ft or 0.0 for nw in nets[:3])
+    lines += [
+        "",
+        f"  top-3 networks hold {100.0 * top3 / total_ft:.0f}% of candidate LF "
+        f"(a connected system concentrates footage; a flat spread means missed tees/gaps)",
+    ]
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
 
-    ap = argparse.ArgumentParser(description="M2 linear measurement report for a vector sheet.")
+    ap = argparse.ArgumentParser(description="M2 linear measurement / M5 networks report for a vector sheet.")
     ap.add_argument("pdf", help="path to the vector PDF sheet")
     ap.add_argument("--page", type=int, default=0, help="0-based page index (default 0)")
+    ap.add_argument("--networks", action="store_true", help="also report M5 connectivity networks")
+    ap.add_argument(
+        "--tol-ft", type=float, default=_DEFAULT_NETWORK_TOL_FT,
+        help="network gap tolerance in feet (default %(default)s)",
+    )
     ap.add_argument("--out", default=None, help="also write the report to this file")
     args = ap.parse_args(argv)
 
@@ -455,6 +602,8 @@ def main(argv: list[str] | None = None) -> int:
 
     geom = extract_pdf_geometry(args.pdf, pages=[args.page])[0]
     report = build_measure_report(geom)
+    if args.networks:
+        report += "\n\n" + build_networks_report(geom, tol_ft=args.tol_ft)
     print(report)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as fh:
