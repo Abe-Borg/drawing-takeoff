@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Iterable, Sequence
 
 from . import scale as _scale
@@ -510,6 +510,105 @@ def heaviest_dark_style(styles: Iterable[StyleKey]) -> StyleKey | None:
     return max(dark, key=lambda s: s.width) if dark else None
 
 
+# ---------------------------------------------------------------------------
+# pipe-size tags (M6): a token -> nominal inches, harvested + snapped to runs
+# ---------------------------------------------------------------------------
+# Standard fire-protection / plumbing nominal sizes (inches) and their labels.
+# A token only counts as a size if it snaps to one of these AND sits next to a
+# pipe run (see linear_feet_by_size), so a stray dimension digit is not a size.
+_SIZE_LABEL: dict[float, str] = {
+    0.5: '1/2"', 0.75: '3/4"', 1.0: '1"', 1.25: '1-1/4"', 1.5: '1-1/2"',
+    2.0: '2"', 2.5: '2-1/2"', 3.0: '3"', 4.0: '4"', 6.0: '6"', 8.0: '8"',
+}
+_UNICODE_FRACTIONS = {
+    "¼": 0.25, "½": 0.5, "¾": 0.75, "⅛": 0.125, "⅜": 0.375, "⅝": 0.625, "⅞": 0.875,
+}
+_DEFAULT_SIZE_RADIUS_FT = 2.0   # ft: a size tag labels the pipe run within this reach
+_SIZE_TRAILING_MARK = re.compile(r'["”Ø]+$')
+_ASCII_FRACTION = re.compile(r"(?:(\d+)[-\s])?(\d+)/(\d+)")
+
+
+def parse_pipe_size_in(text: str) -> float | None:
+    """Parse a size token to nominal inches, or ``None`` if it isn't one.
+
+    Handles the notations these sheets actually use — ``1¼`` / ``1½`` (unicode
+    fractions), bare ``2`` / ``4``, ``1-1/2`` / ``3/4`` (ascii fractions), with
+    an optional ``"`` / ``Ø`` mark — and snaps to a known nominal size, rejecting
+    off-grid numbers (a dimension like ``47``, or the ``1/8"`` scale) so only
+    real pipe sizes pass.
+    """
+    s = _SIZE_TRAILING_MARK.sub("", text.strip()).strip()
+    if not s:
+        return None
+    if s[-1] in _UNICODE_FRACTIONS:
+        whole = s[:-1].strip()
+        try:
+            val = (float(whole) if whole else 0.0) + _UNICODE_FRACTIONS[s[-1]]
+        except ValueError:
+            return None
+    elif "/" in s:
+        m = _ASCII_FRACTION.fullmatch(s)
+        if not m or int(m.group(3)) == 0:   # reject a zero denominator ("1/0") rather than divide by it
+            return None
+        val = (float(m.group(1)) if m.group(1) else 0.0) + float(m.group(2)) / float(m.group(3))
+    else:
+        try:
+            val = float(s)
+        except ValueError:
+            return None
+    for size in _SIZE_LABEL:
+        if abs(val - size) <= 0.02:
+            return size
+    return None
+
+
+def size_tags(geometry: SheetGeometry) -> list[tuple[float, Point]]:
+    """Every word that parses as a nominal pipe size, as ``(size_in, centroid)``."""
+    out: list[tuple[float, Point]] = []
+    for w in geometry.words:
+        size = parse_pipe_size_in(w.text)
+        if size is not None:
+            out.append((size, w.centroid))
+    return out
+
+
+def _nearest_size(run: Run, tags: Sequence[tuple[float, Point]], radius: float) -> float | None:
+    """Nominal size of the nearest tag within ``radius`` of ``run`` (else ``None``)."""
+    segs = _run_segments(run)
+    if not segs:
+        return None
+    best, best_d = None, radius
+    for size, c in tags:
+        d = min(_point_segment_dist(c, a, b) for a, b in segs)
+        if d <= best_d:
+            best_d, best = d, size
+    return best
+
+
+def linear_feet_by_size(
+    runs: Sequence[Run],
+    geometry: SheetGeometry,
+    *,
+    ppf: float,
+    radius_ft: float = _DEFAULT_SIZE_RADIUS_FT,
+) -> dict[float | None, float]:
+    """Total LF of ``runs`` bucketed by nearest pipe-size tag.
+
+    Each run is attributed the nominal size of the nearest size tag within
+    ``radius_ft`` (scale-aware); a run with no tag in reach falls under ``None``
+    — the **unsized remainder**, kept first-class because size callouts are
+    sparse. Size is a property of the run/segment, not the whole network, so a
+    main that reduces shows each size on its own runs.
+    """
+    tags = size_tags(geometry)
+    radius = radius_ft * ppf
+    out: dict[float | None, float] = {}
+    for r in runs:
+        size = _nearest_size(r, tags, radius)
+        out[size] = out.get(size, 0.0) + r.length_pt / ppf
+    return out
+
+
 def build_measure_report(
     geometry: SheetGeometry, *, ppf: float | None = None, span_frac: float = _BORDER_SPAN_FRAC
 ) -> str:
@@ -619,6 +718,57 @@ def build_networks_report(
     return "\n".join(lines)
 
 
+def build_size_report(
+    geometry: SheetGeometry,
+    *,
+    ppf: float | None = None,
+    radius_ft: float = _DEFAULT_SIZE_RADIUS_FT,
+) -> str:
+    """M6 report: linear feet of the candidate pipe by nominal size.
+
+    The deliverable the tool was started for — "how many LF of each size" — over
+    the heaviest-dark candidate linework. Size callouts are sparse, so the
+    headline is the total LF with an explicit **unsized remainder**; the size
+    split is best-effort over whatever tags snap to a run.
+    """
+    if ppf is None:
+        ppf = geometry.points_per_foot
+    lines = [f"=== M6 sizes: {geometry.ref.source} (page {geometry.ref.page_index}) ==="]
+    if not ppf:
+        return "\n".join(lines + ["  no scale on sheet; cannot compute footage"])
+
+    runs_by = runs_by_style(geometry, ppf=ppf, exclude_border=True)
+    pipe_style = heaviest_dark_style(k for k, rs in runs_by.items() if rs)
+    pipe = runs_by.get(pipe_style, []) if pipe_style is not None else []
+    if not pipe:
+        return "\n".join(lines + ["  no candidate (heaviest-dark) linework found"])
+
+    tags = size_tags(geometry)
+    by_size = linear_feet_by_size(pipe, geometry, ppf=ppf, radius_ft=radius_ft)
+    total = sum(by_size.values())
+    unsized = by_size.get(None, 0.0)
+    sized = total - unsized
+    tag_counts = Counter(_SIZE_LABEL[s] for s, _ in tags)
+    lines += [
+        f"candidate lineweight (heaviest dark pen): {_fmt_style(pipe_style)}",
+        f"  {len(pipe)} runs, {total:,.1f} LF;  size tags found: {len(tags)}"
+        + (f"  ({', '.join(f'{k} x{n}' for k, n in tag_counts.most_common())})" if tags else ""),
+        "",
+        f"LINEAR FEET BY SIZE (nearest size tag within {radius_ft:g} ft):",
+    ]
+    for size in sorted(s for s in by_size if s is not None):
+        lines.append(f"  {_SIZE_LABEL[size]:>8s}  {by_size[size]:>10,.1f} LF")
+    pct_unsized = (100.0 * unsized / total) if total else 0.0
+    pct_sized = (100.0 * sized / total) if total else 0.0
+    lines += [
+        f"  {'unsized':>8s}  {unsized:>10,.1f} LF   ({pct_unsized:.0f}% — no size tag within {radius_ft:g} ft)",
+        "",
+        f"sized {pct_sized:.0f}% of candidate LF "
+        f"(size is best-effort; the per-system total stays the trustworthy headline)",
+    ]
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
 
@@ -626,6 +776,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("pdf", help="path to the vector PDF sheet")
     ap.add_argument("--page", type=int, default=0, help="0-based page index (default 0)")
     ap.add_argument("--networks", action="store_true", help="also report M5 connectivity networks")
+    ap.add_argument("--sizes", action="store_true", help="also report M6 linear feet by pipe size")
     ap.add_argument(
         "--tol-ft", type=float, default=_DEFAULT_NETWORK_TOL_FT,
         help="network gap tolerance in feet (default %(default)s)",
@@ -639,6 +790,8 @@ def main(argv: list[str] | None = None) -> int:
     report = build_measure_report(geom)
     if args.networks:
         report += "\n\n" + build_networks_report(geom, tol_ft=args.tol_ft)
+    if args.sizes:
+        report += "\n\n" + build_size_report(geom)
     print(report)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as fh:

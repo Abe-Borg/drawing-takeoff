@@ -307,3 +307,54 @@ def test_build_networks_report_skips_empty_border_style():
     report = measure.build_networks_report(geom)
     assert "no candidate" not in report
     assert "1 network(s)" in report
+
+
+# ---- M6 pipe sizes --------------------------------------------------------
+def test_parse_pipe_size_unicode_bare_and_fraction():
+    assert measure.parse_pipe_size_in("1¼") == 1.25      # unicode fraction
+    assert measure.parse_pipe_size_in("1½") == 1.5
+    assert measure.parse_pipe_size_in("¾") == 0.75
+    assert measure.parse_pipe_size_in("2") == 2.0        # bare integer
+    assert measure.parse_pipe_size_in('4"') == 4.0       # inch-marked
+    assert measure.parse_pipe_size_in("1-1/2") == 1.5    # ascii fraction
+    assert measure.parse_pipe_size_in('3/4"') == 0.75
+
+
+def test_parse_pipe_size_rejects_non_sizes():
+    # off-grid numbers, a length, the 1/8" scale, junk, and zero-denominator
+    # fractions ("1/0" must return None, not raise ZeroDivisionError) aren't sizes
+    for t in ("47", "5", "12-0", '1/8"', "", "A1", "0", "1/0", "0/0"):
+        assert measure.parse_pipe_size_in(t) is None
+
+
+def test_size_tags_harvests_only_sizes():
+    geom = _sheet([_line((0, 0), (108, 0))])
+    geom.words = [
+        TextWord("1¼", (50, 5, 60, 11)),
+        TextWord("2", (70, 5, 76, 11)),
+        TextWord("12-0", (90, 5, 100, 11)),   # a length callout, not a size
+        TextWord("A", (0, 0, 5, 5)),
+    ]
+    assert sorted(s for s, _ in measure.size_tags(geom)) == [1.25, 2.0]
+
+
+def test_linear_feet_by_size_attributes_nearest_tag_and_unsized():
+    near = measure.stitch_runs([_line((0, 0), (108, 0))], ppf=9.0)      # 12 ft run at y=0
+    far = measure.stitch_runs([_line((0, 500), (90, 500))], ppf=9.0)    # 10 ft run far away
+    geom = _sheet([])
+    geom.words = [TextWord("2", (50, 2, 56, 8))]                        # 2" tag on the near run
+    by = measure.linear_feet_by_size(near + far, geom, ppf=9.0, radius_ft=2.0)
+    assert by[2.0] == pytest.approx(12.0)    # near run -> 2"
+    assert by[None] == pytest.approx(10.0)   # far run -> unsized remainder
+
+
+def test_build_size_report_lists_sizes_and_unsized():
+    geom = SheetGeometry(
+        ref=SheetRef("x", 0), page_width_pt=3024, page_height_pt=2160,
+        paths=[_line((100, 100), (1000, 100))], points_per_foot=9.0, scale_label='1/8" = 1\'-0"',
+    )
+    geom.words = [TextWord("4", (500, 95, 510, 105))]   # 4" tag on the 100 ft main
+    report = measure.build_size_report(geom)
+    assert "M6 sizes" in report
+    assert '4"' in report
+    assert "unsized" in report
