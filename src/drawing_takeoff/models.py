@@ -154,6 +154,46 @@ class Run:
 
 
 @dataclass(frozen=True)
+class Network:
+    """A connected component of runs — the M5 unit that maps to one physical
+    system. Built by :func:`drawing_takeoff.measure.networks` via tee-aware
+    (endpoint-to-segment) connectivity, so a branch that tees into the *middle*
+    of a main joins the same network — the way an estimator "follows the line".
+    A network may span lineweights (a main and its branches can differ), so it is
+    deliberately *not* keyed on style. Derived quantities are properties, so a
+    network stays defined by its runs alone.
+    """
+
+    id: str
+    runs: tuple[Run, ...]
+    ppf: float | None = None
+
+    @property
+    def run_count(self) -> int:
+        return len(self.runs)
+
+    @property
+    def length_pt(self) -> float:
+        return sum(r.length_pt for r in self.runs)
+
+    @property
+    def length_ft(self) -> float | None:
+        return (self.length_pt / self.ppf) if self.ppf else None
+
+    @property
+    def bbox(self) -> BBox:
+        return (
+            min(r.bbox[0] for r in self.runs), min(r.bbox[1] for r in self.runs),
+            max(r.bbox[2] for r in self.runs), max(r.bbox[3] for r in self.runs),
+        )
+
+    @property
+    def style_keys(self) -> tuple[StyleKey, ...]:
+        """Distinct styles present — a network can cross lineweights."""
+        return tuple(dict.fromkeys(r.style_key for r in self.runs))
+
+
+@dataclass(frozen=True)
 class SystemLabel:
     """What a line style *means* — the output of the M3 legend/recognition step.
 

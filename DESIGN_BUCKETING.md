@@ -1,8 +1,8 @@
 # Design draft: binding measurement to meaning (the bucketing layer)
 
-> **Status: draft for review — no code.** This is a paper design to react to and poke
-> holes in before any implementation. Sections 9–10 are the open questions and risks I most
-> want pressure-tested. It extends the shipped POC (M1–M4; see `README.md`) with the
+> **Status: M5 shipped; M6–M8 are design.** M5 (connectivity → networks) is implemented and
+> validated on the real sheets (§8); the rest is a plan to react to and poke holes in. Sections
+> 9–10 are the open questions and risks. It extends the shipped POC (M1–M4; see `README.md`) with the
 > classification/bucketing layer the POC deliberately stubbed.
 
 ## 1. Context — the gap this closes
@@ -157,12 +157,22 @@ Diffuser (supply)              —             47   EA     symbol S7 ×47
 
 ## 8. Milestone plan (riskiest / cheapest-to-falsify first)
 
-### M5 — Connectivity graph → networks (NO LLM) ← the new go/no-go gate
-**Objective:** prove anonymous runs collapse into networks that *correspond to real systems*,
-without relying on style. **Build (`measure.py`):** node-snap run endpoints within ε → graph →
-connected components; tee/junction handling; a `networks_report` like M2's. **Exit:** on the real
-sheet, networks line up with the systems a human sees; tee-vs-crossover misgroupings are rare and
-visible.
+### M5 — Connectivity → networks (NO LLM) — VALIDATED & SHIPPED
+**Result on the two real sheets:** the spine holds, but the probe *corrected the model* —
+connectivity must be **endpoint-to-segment (tee-aware)**, not endpoint-to-endpoint: a branch tees
+into the *middle* of a main, so endpoint-only sharing shatters the system (282 pipe runs stayed
+~all singletons). With a **scale-aware ~0.5 ft tolerance** (bridging the breaks pipe picks up at
+fittings) the candidate linework collapses sensibly — FP2.20: 282 runs → 31 networks, top-3 = 57%
+of LF; FP2.21: 144 runs → 11 networks, top-3 = 92%; at 1 ft FP2.20 collapses to essentially one
+connected system (~99%). True crossovers carry no endpoint at the crossing, so a modest tolerance
+doesn't merge them.
+**Shipped (`measure.py` + `models.py`):** `connect_runs` (grid-indexed, near-linear), `networks`
+→ `Network` objects (largest first), `build_networks_report` (+ `measure --networks` CLI), and
+hermetic tests for tee-join / gap-bridge / crossover-safety / disjoint.
+**Caveat the probe exposed:** the candidate set is the no-LLM `heaviest-dark` heuristic — a rough
+proxy that misses branch lineweights and can catch a matchline (FP2.21's two largest "networks"
+span 83–85% of the sheet and are auto-flagged). Connectivity stays robust to that; picking the
+true pipe styles is M7's job.
 
 ### M6 — Tag harvesting + size-segmenting (NO LLM)
 **Objective:** harvest whatever size callouts exist and segment network footage by them — *tags
@@ -186,8 +196,9 @@ tolerance.
 
 ## 9. Open questions to pressure-test
 
-**Settled since this draft:** tee-vs-crossover disambiguation is **deferred** — we take it on
-later; M5 builds connectivity without it and tolerates the misgroupings it leaves. Size-tag
+**Settled since this draft:** tee *connection* (endpoint-to-segment) is **shipped in M5** — it's
+mandatory, or systems shatter; what stays **deferred** is tee-vs-crossover *disambiguation* (a
+near-touch that isn't a real connection), held off by the conservative ~0.5 ft tolerance. Size-tag
 density is **locked as sparse/inconsistent** (§1), so the *unsized remainder* is a first-class
 output, not an edge case to engineer away.
 
@@ -208,7 +219,8 @@ Still open:
 
 | Risk | If it bites | Design response |
 |---|---|---|
-| Connectivity mis-stitches (gaps) | networks span systems or shatter | ε-tuning (M5; tee/crossover disambiguation deferred); LLM `structure_edit` ops; overlay makes it visible |
+| Connectivity over/under-merges | networks span systems or shatter | endpoint-to-segment joins + scale-aware ~0.5 ft tol (M5, validated on real sheets); crossover disambiguation deferred; LLM `structure_edit` ops; overlay makes it visible |
+| Candidate pipe set contaminated | a matchline/non-pipe enters, or branch lineweights missed | M7 LLM picks the real pipe styles; M5 already flags networks spanning ~the whole sheet |
 | Size tags sparse (assumed) | most footage unsized | per-system **total** is the solid headline; `unsized remainder` is first-class; LLM-proposed size is advisory/flagged, never totaled |
 | Too many networks for set-of-marks | unreadable overlay, poor grounding | hierarchical labeling (region → network); number only candidates |
 | LLM tempted to emit quantities | trust collapse | contract forbids numbers; tools own all math; aggregation ignores any number the model returns |
