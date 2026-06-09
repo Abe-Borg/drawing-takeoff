@@ -281,3 +281,29 @@ def test_build_networks_report_reports_a_connected_system():
 def test_build_networks_report_without_scale():
     geom = _sheet([_line((0, 0), (9, 0))], ppf=None)
     assert "no scale" in measure.build_networks_report(geom)
+
+
+def test_networks_connect_along_a_diagonal_main():
+    # a 45deg main + a branch whose endpoint lands on it -> one network. Exercises
+    # the diagonal grid-traversal registration (a bbox fill would also work but is
+    # the pathological case the walk replaces).
+    main = measure.stitch_runs([_line((0, 0), (200, 200))], ppf=9.0)
+    branch = measure.stitch_runs([_line((100, 100), (100, 160))], ppf=9.0)
+    nets = measure.networks(main + branch, ppf=9.0)
+    assert len(nets) == 1
+    assert nets[0].run_count == 2
+
+
+def test_build_networks_report_skips_empty_border_style():
+    # a heavy black sheet border (its own pen, fully border-excluded) is *thicker*
+    # than the pipe pen; the candidate pick must skip the now-empty border style
+    # and still find the pipe, not report "no candidate".
+    border = _line((0, 0), (3024, 0), stroke_color=(0.0, 0.0, 0.0), width=2.0)
+    pipe = [_line((100, 100), (1000, 100)), _line((500, 100), (500, 400))]  # black 1.3
+    geom = SheetGeometry(
+        ref=SheetRef("x", 0), page_width_pt=3024, page_height_pt=2160,
+        paths=[border, *pipe], points_per_foot=9.0, scale_label='1/8" = 1\'-0"',
+    )
+    report = measure.build_networks_report(geom)
+    assert "no candidate" not in report
+    assert "1 network(s)" in report

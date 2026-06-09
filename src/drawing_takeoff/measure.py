@@ -349,6 +349,40 @@ def _run_segments(run: Run) -> list[tuple[Point, Point]]:
     return [(pl[i], pl[i + 1]) for i in range(len(pl) - 1)]
 
 
+def _segment_cells(a: Point, b: Point, cell: float):
+    """Yield every grid cell (size ``cell``) the segment ``ab`` passes through.
+
+    A 2D DDA (Amanatides-Woo) grid walk, so a long diagonal registers in
+    O(length/cell) cells *along its path* instead of filling its whole bounding
+    box (a sheet-spanning diagonal would otherwise create hundreds of thousands
+    of entries). Every cell the segment crosses is yielded, so the 3x3 endpoint
+    query below stays correct.
+    """
+    ax, ay = a
+    bx, by = b
+    cx, cy = math.floor(ax / cell), math.floor(ay / cell)
+    ex, ey = math.floor(bx / cell), math.floor(by / cell)
+    yield (cx, cy)
+    dx, dy = bx - ax, by - ay
+    sx = 1 if dx > 0 else -1 if dx < 0 else 0
+    sy = 1 if dy > 0 else -1 if dy < 0 else 0
+    t_max_x = ((cx + (1 if sx > 0 else 0)) * cell - ax) / dx if sx else math.inf
+    t_max_y = ((cy + (1 if sy > 0 else 0)) * cell - ay) / dy if sy else math.inf
+    t_delta_x = (cell / abs(dx)) if sx else math.inf
+    t_delta_y = (cell / abs(dy)) if sy else math.inf
+    # bound the walk to the Manhattan cell span (+slack) so float error can't loop
+    remaining = 2 * (abs(ex - cx) + abs(ey - cy)) + 4
+    while (cx, cy) != (ex, ey) and remaining > 0:
+        remaining -= 1
+        if t_max_x <= t_max_y:
+            t_max_x += t_delta_x
+            cx += sx
+        else:
+            t_max_y += t_delta_y
+            cy += sy
+        yield (cx, cy)
+
+
 def connect_runs(runs: Sequence[Run], *, tol: float) -> list[list[int]]:
     """Group run indices into connected components ("networks").
 
@@ -360,8 +394,9 @@ def connect_runs(runs: Sequence[Run], *, tol: float) -> list[list[int]]:
     (see :func:`networks`); a true crossover carries no endpoint at the crossing,
     so a modest ``tol`` does not merge the two lines that cross there.
 
-    Segments are indexed into a ``tol``-sized grid and each endpoint probes only
-    its 3x3 cell neighborhood, so the pass is near-linear, not O(n^2).
+    Segments are indexed into a ``tol``-sized grid — walked cell-by-cell so a
+    long diagonal doesn't fill its bbox — and each endpoint probes only its 3x3
+    cell neighborhood, so the pass is near-linear, not O(n^2).
     """
     n = len(runs)
     if n == 0:
@@ -370,11 +405,8 @@ def connect_runs(runs: Sequence[Run], *, tol: float) -> list[list[int]]:
     grid: dict[tuple[int, int], list[tuple[int, Point, Point]]] = defaultdict(list)
     for i, r in enumerate(runs):
         for a, b in _run_segments(r):
-            cx0, cx1 = sorted((math.floor(a[0] / cell), math.floor(b[0] / cell)))
-            cy0, cy1 = sorted((math.floor(a[1] / cell), math.floor(b[1] / cell)))
-            for cx in range(cx0, cx1 + 1):
-                for cy in range(cy0, cy1 + 1):
-                    grid[(cx, cy)].append((i, a, b))
+            for c in _segment_cells(a, b, cell):
+                grid[c].append((i, a, b))
 
     uf = _UnionFind(n)
     for i, r in enumerate(runs):
@@ -554,7 +586,10 @@ def build_networks_report(
         return "\n".join(lines + ["  no scale on sheet; cannot compute footage"])
 
     runs_by = runs_by_style(geometry, ppf=ppf, exclude_border=True)
-    pipe_style = heaviest_dark_style(runs_by.keys())
+    # Only consider styles that still have runs: border exclusion can empty a
+    # style's list (e.g. a heavy black sheet border), and that empty style must
+    # not win the heaviest-dark pick over a thinner pipe pen that has runs.
+    pipe_style = heaviest_dark_style(k for k, rs in runs_by.items() if rs)
     pipe = runs_by.get(pipe_style, []) if pipe_style is not None else []
     if not pipe:
         return "\n".join(lines + ["  no candidate (heaviest-dark) linework found"])
