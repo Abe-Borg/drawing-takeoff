@@ -321,8 +321,9 @@ def test_parse_pipe_size_unicode_bare_and_fraction():
 
 
 def test_parse_pipe_size_rejects_non_sizes():
-    # off-grid numbers, a length, the 1/8" scale, and junk are not pipe sizes
-    for t in ("47", "5", "12-0", '1/8"', "", "A1", "0"):
+    # off-grid numbers, a length, the 1/8" scale, junk, and zero-denominator
+    # fractions ("1/0" must return None, not raise ZeroDivisionError) aren't sizes
+    for t in ("47", "5", "12-0", '1/8"', "", "A1", "0", "1/0", "0/0"):
         assert measure.parse_pipe_size_in(t) is None
 
 

@@ -548,7 +548,7 @@ def parse_pipe_size_in(text: str) -> float | None:
             return None
     elif "/" in s:
         m = _ASCII_FRACTION.fullmatch(s)
-        if not m:
+        if not m or int(m.group(3)) == 0:   # reject a zero denominator ("1/0") rather than divide by it
             return None
         val = (float(m.group(1)) if m.group(1) else 0.0) + float(m.group(2)) / float(m.group(3))
     else:
