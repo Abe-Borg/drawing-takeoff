@@ -8,8 +8,8 @@ propagate system labels to every same-styled line by exact style match.
 > **Status: end-to-end POC (M1–M4).** Drop in a set of vector sheets → a takeoff CSV grouped
 > by system. Geometry + scale (M1), border-aware run stitching + per-style footage (M2),
 > legend labeling via one Claude tool-use call (M3), and the `extract_takeoff` pipeline +
-> CSV export + drag-drop GUI (M4) all ship. See **`IMPLEMENTATION_PLAN.md`** for the
-> milestone plan and **`KICKOFF.md`** for the handoff.
+> CSV export + drag-drop GUI (M4) all ship. See **`DESIGN_BUCKETING.md`** for the next
+> phase: binding measured footage to system × size buckets.
 
 ## Install & test
 
