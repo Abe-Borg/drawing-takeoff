@@ -7,7 +7,7 @@ propagate system labels to every same-styled line by exact style match.
 
 > **Status: end-to-end POC (M1–M4).** Drop in a set of vector sheets → a takeoff CSV grouped
 > by system. Geometry + scale (M1), border-aware run stitching + per-style footage (M2),
-> legend labeling via one Claude tool-use call (M3), and the `extract_takeoff` pipeline +
+> legend labeling via one structured Claude call (M3), and the `extract_takeoff` pipeline +
 > CSV export + drag-drop GUI (M4) all ship. See **`DESIGN_BUCKETING.md`** for the next
 > phase: binding measured footage to system × size buckets.
 
@@ -65,7 +65,7 @@ src/drawing_takeoff/
   scale.py             # M1: scale-label -> points_per_foot; dimension verifier
   diagnose.py          # M1: go/no-go diagnostic report (pure; runs on models)
   measure.py           # M2: length primitives, run stitching, per-style footage
-  legend.py            # M3: legend labeling via one Claude tool-use call (style -> system)
+  legend.py            # M3: legend labeling via one structured Claude call (style -> system)
   pipeline.py          # M4: extract_takeoff — geometry -> measure -> legend -> totals
   export.py            # M4: takeoff CSV + diagnostics (pure builders + file writer)
   gui.py               # M4: drag-drop front-end over extract_takeoff (needs [gui])

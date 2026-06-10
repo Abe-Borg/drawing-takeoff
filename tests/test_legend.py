@@ -1,17 +1,26 @@
-"""Hermetic tests for the M3 legend step — the project's first tool-use call.
+"""Hermetic tests for the M3 legend step — the project's first LLM call.
 
-No network, no PyMuPDF: a ``FakeClient`` returns a scripted ``tool_use`` block
-(the structured style->system mapping) and ``legend.label_styles`` is asserted to
-build the forced-tool request and parse the response, flagging anything the model
-omits rather than trusting it.
+No network, no PyMuPDF: a ``FakeClient`` returns a scripted text block carrying
+the structured-output JSON (the style->system mapping) and ``legend.label_styles``
+is asserted to build the schema-enforced request (JSON response format + adaptive
+thinking + effort) and parse the response, flagging anything the model omits
+rather than trusting it.
 """
 from __future__ import annotations
+
+import json
 
 import pytest
 
 from drawing_takeoff import legend, measure
+from drawing_takeoff.core import api_config
 from drawing_takeoff.models import GeometryPath, Network, SheetGeometry, SheetRef, SystemLabel, TextWord
-from tests.fixtures.fake_anthropic import FakeClient, FakeMessage, FakeToolUseBlock, FakeUsage
+from tests.fixtures.fake_anthropic import FakeClient, FakeMessage, FakeTextBlock, FakeUsage
+
+
+def _labels_message(labels, **message_kwargs):
+    """A structured-output reply: the labels JSON in a plain text block."""
+    return FakeMessage(content=[FakeTextBlock(text=json.dumps({"labels": labels}))], **message_kwargs)
 
 
 def _line(p0, p1, *, color, width):
@@ -49,27 +58,23 @@ def geom():
 
 
 def _responder_only_s0(kwargs):
-    # The request must force the single structured tool.
-    assert kwargs["tool_choice"] == {"type": "tool", "name": "record_system_labels"}
-    assert any(t["name"] == "record_system_labels" for t in kwargs["tools"])
-    return FakeMessage(
-        content=[
-            FakeToolUseBlock(
-                name="record_system_labels",
-                input={
-                    "labels": [
-                        {
-                            "style_id": "s0",
-                            "system": "Fire-protection sprinkler pipe",
-                            "measurable": True,
-                            "confidence": "high",
-                            "ambiguous": False,
-                            "reasoning": "Heavy black pen, many long runs — the primary FP system.",
-                        }
-                        # s1 deliberately omitted to exercise the flag-don't-guess default.
-                    ]
-                },
-            )
+    # The request must enforce the labels schema via the JSON response format
+    # (a forced tool call would be incompatible with adaptive thinking).
+    fmt = kwargs["output_config"]["format"]
+    assert fmt["type"] == "json_schema"
+    assert fmt["schema"]["required"] == ["labels"]
+    assert "tools" not in kwargs and "tool_choice" not in kwargs
+    return _labels_message(
+        [
+            {
+                "style_id": "s0",
+                "system": "Fire-protection sprinkler pipe",
+                "measurable": True,
+                "confidence": "high",
+                "ambiguous": False,
+                "reasoning": "Heavy black pen, many long runs — the primary FP system.",
+            }
+            # s1 deliberately omitted to exercise the flag-don't-guess default.
         ],
         usage=FakeUsage(input_tokens=120, output_tokens=40),
     )
@@ -118,6 +123,49 @@ def test_label_styles_passes_images_when_provided(geom):
     assert kinds.count("image") == 2  # swatch + legend image both attached
 
 
+def test_label_styles_sends_pdf_legend_as_document_block(geom):
+    # A PDF legend rides a native ``document`` block (text layer + page image)
+    # and wins over a simultaneously-passed raster legend.
+    captured = {}
+
+    def responder(kwargs):
+        captured["content"] = kwargs["messages"][0]["content"]
+        return _responder_only_s0(kwargs)
+
+    legend.label_styles(
+        geom,
+        client=FakeClient(responder),
+        legend_image=b"\x89PNG-legend",
+        legend_pdf=b"%PDF-fake",
+    )
+    kinds = [b.get("type") for b in captured["content"]]
+    assert kinds.count("document") == 1 and kinds.count("image") == 0
+    doc = next(b for b in captured["content"] if b.get("type") == "document")
+    assert doc["source"]["media_type"] == "application/pdf"
+
+
+def test_label_styles_request_carries_thinking_and_effort(geom):
+    # The labeling phase policy: adaptive thinking + high effort + the 16k cap
+    # (thinking shares max_tokens, so the old 4k cap would starve it).
+    captured = {}
+
+    def responder(kwargs):
+        captured.update(kwargs)
+        return _responder_only_s0(kwargs)
+
+    legend.label_styles(geom, client=FakeClient(responder), model=api_config.MODEL_SONNET_46)
+    assert captured["thinking"] == {"type": "adaptive"}
+    assert captured["output_config"]["effort"] == "high"
+    assert captured["max_tokens"] == api_config.LABELING_OUTPUT_CAP
+
+
+def test_label_styles_malformed_json_flags_everything(geom):
+    # A reply that fails to parse must flag every style, never raise or guess.
+    client = FakeClient(lambda kw: FakeMessage(content=[FakeTextBlock(text="not json {")]))
+    labels = legend.label_styles(geom, client=client)
+    assert labels and all(lab.ambiguous and not lab.measurable for lab in labels.values())
+
+
 def test_cli_requires_api_key(monkeypatch, capsys):
     # The legend CLI is the LLM step — with no key it must bail before any work
     # (no PDF read, no network), not crash.
@@ -154,17 +202,19 @@ def _net_geom(words=None):
 
 
 def _net_responder(kwargs):
-    assert kwargs["tool_choice"] == {"type": "tool", "name": "record_network_labels"}
-    assert any(t["name"] == "record_network_labels" for t in kwargs["tools"])
-    return FakeMessage(content=[FakeToolUseBlock(
-        name="record_network_labels",
-        input={"labels": [
+    fmt = kwargs["output_config"]["format"]
+    assert fmt["type"] == "json_schema"
+    assert fmt["schema"]["required"] == ["labels"]
+    assert "tools" not in kwargs and "tool_choice" not in kwargs
+    return _labels_message(
+        [
             {"network_id": "N0", "system": "Fire-protection sprinkler", "is_pipe": True,
              "confidence": "high", "ambiguous": False, "reasoning": "main with branches"},
             {"network_id": "N1", "system": "Matchline / non-pipe", "is_pipe": False,
              "confidence": "high", "ambiguous": False, "reasoning": "spans the sheet, no branches"},
-        ]},
-    )], usage=FakeUsage(input_tokens=100, output_tokens=50))
+        ],
+        usage=FakeUsage(input_tokens=100, output_tokens=50),
+    )
 
 
 def test_label_networks_keys_on_ids_and_maps_is_pipe():
@@ -179,12 +229,35 @@ def test_label_networks_flags_unreturned_network():
     nets = [_network("N0", ((0, 0), (100, 0))), _network("N1", ((0, 50), (100, 50)))]
 
     def resp(kw):
-        return FakeMessage(content=[FakeToolUseBlock(name="record_network_labels", input={"labels": [
+        return _labels_message([
             {"network_id": "N0", "system": "FP sprinkler", "is_pipe": True,
-             "confidence": "high", "ambiguous": False, "reasoning": "x"}]})])
+             "confidence": "high", "ambiguous": False, "reasoning": "x"}])
 
     labels = legend.label_networks(_net_geom(), nets, client=FakeClient(resp))
     assert labels["N1"].ambiguous is True and labels["N1"].measurable is False
+
+
+def test_label_networks_routes_dense_sheets_to_opus():
+    # ≤ threshold -> the validated Sonnet default; past it -> the Opus tier,
+    # whose larger image cap keeps the crowded set-of-marks overlay legible.
+    captured = {}
+
+    def resp(kw):
+        captured["model"] = kw["model"]
+        return _labels_message([])
+
+    few = [_network(f"N{i}", ((0, 10 * i), (50, 10 * i))) for i in range(2)]
+    legend.label_networks(_net_geom(), few, client=FakeClient(resp))
+    assert captured["model"] == api_config.LABELING_MODEL_DEFAULT
+
+    many = [_network(f"N{i}", ((0, 5 * i), (50, 5 * i)))
+            for i in range(legend._DENSE_NETWORK_THRESHOLD + 1)]
+    legend.label_networks(_net_geom(), many, client=FakeClient(resp))
+    assert captured["model"] == api_config.LABELING_DENSE_MODEL_DEFAULT
+
+    # An explicit model always wins over the routing.
+    legend.label_networks(_net_geom(), many, client=FakeClient(resp), model="custom-model")
+    assert captured["model"] == "custom-model"
 
 
 def test_system_size_takeoff_buckets_trusted_and_reviews_rest():

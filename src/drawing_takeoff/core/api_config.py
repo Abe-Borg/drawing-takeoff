@@ -11,6 +11,10 @@ Model identifiers may be overridden via env vars:
     DRAWING_TAKEOFF_VERIFICATION_ESCALATION_MODEL — escalation (default Opus 4.8).
     DRAWING_TAKEOFF_TRIAGE_MODEL                — verification triage
                                               (default Haiku 4.5).
+    DRAWING_TAKEOFF_LABELING_MODEL              — sheet labeling (default
+                                              Sonnet 4.6).
+    DRAWING_TAKEOFF_LABELING_DENSE_MODEL        — labeling of dense sheets
+                                              (default Opus 4.8).
 """
 from __future__ import annotations
 
@@ -49,6 +53,19 @@ VERIFICATION_ESCALATION_MODEL = os.environ.get(
 # task is shallow classification over short inputs; Haiku fits.
 TRIAGE_MODEL_DEFAULT = os.environ.get("DRAWING_TAKEOFF_TRIAGE_MODEL", MODEL_HAIKU_45)
 
+# Sheet labeling (legend.label_networks — the M7 set-of-marks call). Sonnet 4.6
+# was validated for this vision+reasoning task by the M7 probe at a fraction of
+# Opus's cost. Dense sheets route to the Opus tier instead: the set-of-marks
+# overlay renders at 2400px on the long edge, which Opus 4.7+ accepts at full
+# resolution (2576px image cap) while Sonnet 4.6 downscales to 1568px — and the
+# more numbered networks share one sheet, the more that resolution matters for
+# reading the marks. The dense threshold lives at the call site (legend.py),
+# which knows the network count; only the model choice is policy here.
+LABELING_MODEL_DEFAULT = os.environ.get("DRAWING_TAKEOFF_LABELING_MODEL", MODEL_SONNET_46)
+LABELING_DENSE_MODEL_DEFAULT = os.environ.get(
+    "DRAWING_TAKEOFF_LABELING_DENSE_MODEL", MODEL_OPUS_48
+)
+
 
 # Convenience sets for output-cap dispatch. Every Opus family member shares
 # the 128k output ceiling and the high-effort escalation tier, so newer Opus
@@ -86,6 +103,11 @@ VERIFICATION_OUTPUT_CAP = 16_000
 # Triage emits a small array of {index, classification, reason}; 8k is more
 # than enough even for a 50-finding chunk.
 HAIKU_TRIAGE_OUTPUT_CAP = 8_000
+# Labeling replies are a small JSON array, but adaptive thinking shares
+# max_tokens with the visible output — the old 4k cap would starve the
+# thinking that motivates the budget. 16k stays under the SDK's
+# streaming-required threshold.
+LABELING_OUTPUT_CAP = 16_000
 
 # Token threshold above which a review uses the larger batch cap.
 LARGE_REVIEW_INPUT_THRESHOLD = 200_000
@@ -100,6 +122,7 @@ PHASE_VERIFICATION = "verification"
 PHASE_VERIFICATION_RETRY = "verification_retry"
 PHASE_VERIFICATION_CONTINUATION = "verification_continuation"
 PHASE_TRIAGE = "triage"
+PHASE_LABELING = "labeling"
 
 
 def output_cap_for_model(model: str, *, requested: int) -> int:
@@ -130,6 +153,7 @@ _PHASE_OUTPUT_BUDGET: dict[str, int] = {
     PHASE_VERIFICATION_RETRY: VERIFICATION_OUTPUT_CAP,
     PHASE_VERIFICATION_CONTINUATION: VERIFICATION_OUTPUT_CAP,
     PHASE_TRIAGE: HAIKU_TRIAGE_OUTPUT_CAP,
+    PHASE_LABELING: LABELING_OUTPUT_CAP,
 }
 
 
@@ -466,6 +490,11 @@ _PHASE_DEFAULT_EFFORT: dict[str, str] = {
     PHASE_VERIFICATION: EFFORT_MEDIUM,
     PHASE_VERIFICATION_RETRY: EFFORT_MEDIUM,
     PHASE_VERIFICATION_CONTINUATION: EFFORT_MEDIUM,
+    # Labeling is a single-shot vision classification — ``high`` is Anthropic's
+    # recommended minimum for intelligence-sensitive work and is accepted by
+    # both the Sonnet default and the Opus dense tier (no clamp needed);
+    # ``xhigh`` is tuned for coding/agentic loops, not one structured reply.
+    PHASE_LABELING: EFFORT_HIGH,
 }
 
 # Verification phases get the model-aware bump: Opus on verification is
@@ -591,6 +620,10 @@ _PHASE_CACHE_POLICY: dict[str, CachePolicy] = {
     # below the 2048-token Haiku cache minimum so repeated calls cannot
     # hit. Skip caching to avoid the cache-write cost.
     PHASE_TRIAGE: CachePolicy(cache_system=False, cache_tools=False),
+    # Labeling: ~500-token system prompts, below the cache minimum on both
+    # the Sonnet default (2048) and the Opus dense tier (4096) — a cache
+    # write would be paid for nothing.
+    PHASE_LABELING: CachePolicy(cache_system=False, cache_tools=False),
 }
 
 

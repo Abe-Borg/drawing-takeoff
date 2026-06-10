@@ -6,11 +6,13 @@ exercised without a backend.
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from drawing_takeoff import pipeline
 from drawing_takeoff.models import GeometryPath, SheetGeometry, SheetRef, StyleKey, TakeoffItem
-from tests.fixtures.fake_anthropic import FakeClient, FakeMessage, FakeToolUseBlock
+from tests.fixtures.fake_anthropic import FakeClient, FakeMessage, FakeTextBlock
 
 
 def _line(p0, p1, *, color, width):
@@ -29,7 +31,7 @@ def _line(p0, p1, *, color, width):
 def _client(labels):
     return FakeClient(
         lambda kw: FakeMessage(
-            content=[FakeToolUseBlock(name="record_system_labels", input={"labels": labels})]
+            content=[FakeTextBlock(text=json.dumps({"labels": labels}))]
         )
     )
 

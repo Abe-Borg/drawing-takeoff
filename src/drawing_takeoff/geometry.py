@@ -185,6 +185,23 @@ def render_page_png(
         return pix.tobytes("png")
 
 
+def extract_page_pdf(pdf_path: str, page_index: int = 0) -> bytes:
+    """Extract one page as a standalone PDF (bytes) for native-PDF API input.
+
+    A legend/lead sheet sent as a ``document`` block gives the model the page's
+    real text layer alongside the rendered image — legends are mostly text, and
+    reading it as text beats OCR-ing a 150-dpi raster. Extracting the single
+    page keeps the request small regardless of the source document's size.
+    """
+    with fitz.open(pdf_path) as src:
+        out = fitz.open()
+        try:
+            out.insert_pdf(src, from_page=page_index, to_page=page_index)
+            return out.tobytes()
+        finally:
+            out.close()
+
+
 # Fixed palette so a network keeps the same color across the image (and any caption).
 _NETWORK_COLORS = [
     (0.85, 0.10, 0.10), (0.10, 0.35, 0.90), (0.10, 0.62, 0.20), (0.95, 0.55, 0.05),
