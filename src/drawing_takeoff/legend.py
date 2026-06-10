@@ -433,6 +433,21 @@ def _parse_network_response(response, networks) -> dict[str, SystemLabel]:
 _PAGE_SPAN_ADVISORY = 0.80
 
 
+def _page_spanning_confirms(networks, labels: dict[str, SystemLabel], geometry: SheetGeometry) -> list[str]:
+    """Counted networks that span ~the whole sheet — flagged for a main-vs-matchline
+    glance (a long main and a matchline both span the sheet). Shared by the text
+    report and the workbook so the two review surfaces can't drift."""
+    pw, ph = geometry.page_width_pt, geometry.page_height_pt
+    out = []
+    for nw in networks:
+        lab = labels.get(nw.id)
+        if lab is not None and lab.trusted and pw and ph:
+            x0, y0, x1, y1 = nw.bbox
+            if max((x1 - x0) / pw, (y1 - y0) / ph) >= _PAGE_SPAN_ADVISORY:
+                out.append(f"{nw.id} ({lab.system})")
+    return out
+
+
 def system_size_takeoff(
     networks,
     labels: dict[str, SystemLabel],
@@ -505,14 +520,7 @@ def build_system_size_report(
 
     # Counted networks that span ~the whole sheet are worth a human glance (a long
     # main and a matchline both span the sheet; the model judged this one pipe).
-    pw, ph = geometry.page_width_pt, geometry.page_height_pt
-    spanning = []
-    for nw in networks:
-        lab = labels.get(nw.id)
-        if lab is not None and lab.trusted and pw and ph:
-            x0, y0, x1, y1 = nw.bbox
-            if max((x1 - x0) / pw, (y1 - y0) / ph) >= _PAGE_SPAN_ADVISORY:
-                spanning.append(f"{nw.id} ({lab.system})")
+    spanning = _page_spanning_confirms(networks, labels, geometry)
     if spanning:
         lines += ["", "CONFIRM (counted, but span ~the whole sheet — main vs matchline): " + ", ".join(spanning)]
     if review:
@@ -539,9 +547,10 @@ def takeoff_tables(networks, labels: dict[str, SystemLabel], geometry: SheetGeom
         x0, y0, x1, y1 = nw.bbox
         pct = round(100.0 * max((x1 - x0) / pw, (y1 - y0) / ph)) if pw and ph else 0
         by_size = measure.linear_feet_by_size(nw.runs, geometry, ppf=ppf, radius_ft=radius_ft)
-        sizes = ", ".join(
-            f"{measure.size_label(s)}={v:.0f}" for s, v in sorted((k, v) for k, v in by_size.items() if k is not None)
-        )
+        size_parts = [f"{measure.size_label(s)}={v:.0f}" for s, v in sorted((k, v) for k, v in by_size.items() if k is not None)]
+        if by_size.get(None, 0.0):
+            size_parts.append(f"unsized={by_size[None]:.0f}")  # keep unsized so Sizes reconciles to LF
+        sizes = ", ".join(size_parts)
         detail.append({
             "network": nw.id,
             "system": lab.system if lab is not None else "(unlabeled)",
@@ -554,7 +563,13 @@ def takeoff_tables(networks, labels: dict[str, SystemLabel], geometry: SheetGeom
             "sizes": sizes,
             "reasoning": (lab.reasoning if lab is not None else "") or "",
         })
-    return {"by_system_size": by, "detail": detail, "review": list(review)}
+    review_notes = list(review)
+    spanning = _page_spanning_confirms(networks, labels, geometry)
+    if spanning:
+        review_notes.append(
+            "CONFIRM (counted, but span ~the whole sheet — main vs matchline): " + ", ".join(spanning)
+        )
+    return {"by_system_size": by, "detail": detail, "review": review_notes}
 
 
 def _load_legend_image(path: str, page: int) -> bytes:

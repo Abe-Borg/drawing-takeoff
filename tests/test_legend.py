@@ -225,3 +225,14 @@ def test_takeoff_tables_summary_detail_review():
     assert tables["detail"][0]["counted"] is True and tables["detail"][0]["is_pipe"] is True
     assert tables["detail"][1]["counted"] is False     # N1 non-pipe excluded
     assert any("N1" in r for r in tables["review"])
+
+
+def test_takeoff_tables_detail_keeps_unsized_and_review_has_confirm():
+    geom = _net_geom(words=[TextWord("2", (10, 2, 16, 8))])   # 2" tag near the start only
+    # one network: a run near the tag (sized 2") + a run far from any tag (unsized);
+    # its bbox spans the page width, so it also triggers the CONFIRM advisory.
+    n0 = _network("N0", ((0, 0), (50, 0)), ((200, 0), (250, 0)))
+    labels = {"N0": SystemLabel(system="FP sprinkler", measurable=True, confidence="high", ambiguous=False)}
+    tables = legend.takeoff_tables([n0], labels, geom, ppf=9.0)
+    assert '2"' in tables["detail"][0]["sizes"] and "unsized" in tables["detail"][0]["sizes"]
+    assert any("CONFIRM" in r for r in tables["review"])
