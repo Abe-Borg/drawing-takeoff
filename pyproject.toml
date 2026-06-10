@@ -14,6 +14,7 @@ dependencies = [
     "pymupdf",          # AGPL-3.0 — keep all usage isolated to geometry.py
     "tiktoken",
     "platformdirs",
+    "openpyxl",         # M8: Excel takeoff workbook
 ]
 
 [project.optional-dependencies]

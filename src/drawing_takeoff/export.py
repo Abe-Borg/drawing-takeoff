@@ -112,3 +112,74 @@ def write_takeoff_export(
     for name, content in build_takeoff_documents(result):
         (folder / name).write_text(content, encoding="utf-8")
     return folder
+
+
+# ---------------------------------------------------------------------------
+# M8: Excel workbook (System x Size summary + per-network detail + review)
+# ---------------------------------------------------------------------------
+# Nominal-size order for the Summary tab (labels match measure.size_label);
+# 'unsized' sorts last. Kept local so export stays decoupled from measure.
+_SIZE_ORDER = {
+    '1/2"': 0.5, '3/4"': 0.75, '1"': 1.0, '1-1/4"': 1.25, '1-1/2"': 1.5,
+    '2"': 2.0, '2-1/2"': 2.5, '3"': 3.0, '4"': 4.0, '6"': 6.0, '8"': 8.0, "unsized": 1e9,
+}
+
+
+def _autosize(ws) -> None:
+    for col in ws.columns:
+        width = max((len(str(c.value)) for c in col if c.value is not None), default=8)
+        ws.column_dimensions[col[0].column_letter].width = min(max(width + 2, 10), 60)
+
+
+def build_takeoff_workbook(tables: dict):
+    """Pure: a takeoff -> an openpyxl ``Workbook`` (Summary / Detail / Review tabs).
+
+    ``tables`` is the plain-data shape from :func:`drawing_takeoff.legend.takeoff_tables`
+    (``by_system_size``, ``detail`` rows, ``review`` notes), so this writer never
+    touches the engine's model types. openpyxl is imported lazily so the rest of
+    ``export`` stays import-light.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+
+    bold = Font(bold=True)
+    wb = Workbook()
+
+    ws = wb.active
+    ws.title = "Summary"
+    ws.append(["System", "Size", "Linear Feet"])
+    for c in ws[1]:
+        c.font = bold
+    systems: dict[str, dict[str, float]] = {}
+    for (system, size), lf in tables.get("by_system_size", {}).items():
+        systems.setdefault(system, {})[size] = lf
+    for system in sorted(systems, key=lambda s: -sum(systems[s].values())):
+        for size, lf in sorted(systems[system].items(), key=lambda kv: _SIZE_ORDER.get(kv[0], 1e8)):
+            ws.append([system, size, round(lf, 1)])
+        ws.append([f"{system} — total", "", round(sum(systems[system].values()), 1)])
+        ws.cell(ws.max_row, 1).font = bold
+        ws.cell(ws.max_row, 3).font = bold
+    if not systems:
+        ws.append(["(no trusted pipe networks)", "", ""])
+
+    ws2 = wb.create_sheet("Detail")
+    ws2.append(["Network", "System", "Is Pipe", "Counted", "Confidence", "Ambiguous",
+                "Linear Feet", "% Page", "Sizes", "Reasoning"])
+    for c in ws2[1]:
+        c.font = bold
+    for r in tables.get("detail", []):
+        ws2.append([
+            r["network"], r["system"], "yes" if r["is_pipe"] else "no",
+            "yes" if r["counted"] else "no", r["confidence"], "yes" if r["ambiguous"] else "no",
+            r["linear_feet"], r["pct_page"], r["sizes"], r["reasoning"],
+        ])
+
+    ws3 = wb.create_sheet("Review")
+    ws3.append(["Review — confirm / not counted"])
+    ws3["A1"].font = bold
+    for note in tables.get("review", []):
+        ws3.append([note])
+
+    for sheet in (ws, ws2, ws3):
+        _autosize(sheet)
+    return wb

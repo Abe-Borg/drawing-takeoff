@@ -209,3 +209,19 @@ def test_build_system_size_report_smoke():
     labels = {"N0": SystemLabel(system="FP sprinkler", measurable=True, confidence="high", ambiguous=False)}
     report = legend.build_system_size_report(nets, labels, geom, ppf=9.0)
     assert "M7 takeoff" in report and "FP sprinkler" in report and '2"' in report
+
+
+def test_takeoff_tables_summary_detail_review():
+    geom = _net_geom(words=[TextWord("2", (50, 2, 56, 8))])
+    n0 = _network("N0", ((0, 0), (100, 0)))
+    n1 = _network("N1", ((0, 50), (100, 50)))
+    labels = {
+        "N0": SystemLabel(system="FP sprinkler", measurable=True, confidence="high", ambiguous=False),
+        "N1": SystemLabel(system="Matchline", measurable=False, confidence="high", ambiguous=False),
+    }
+    tables = legend.takeoff_tables([n0, n1], labels, geom, ppf=9.0)
+    assert tables["by_system_size"][("FP sprinkler", '2"')] == pytest.approx(100 / 9)
+    assert [r["network"] for r in tables["detail"]] == ["N0", "N1"]
+    assert tables["detail"][0]["counted"] is True and tables["detail"][0]["is_pipe"] is True
+    assert tables["detail"][1]["counted"] is False     # N1 non-pipe excluded
+    assert any("N1" in r for r in tables["review"])
