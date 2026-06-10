@@ -609,6 +609,11 @@ def linear_feet_by_size(
     return out
 
 
+def size_label(size_in: float) -> str:
+    """Human label for a nominal pipe size in inches (1.25 -> '1-1/4"')."""
+    return _SIZE_LABEL.get(size_in, f'{size_in:g}"')
+
+
 def build_measure_report(
     geometry: SheetGeometry, *, ppf: float | None = None, span_frac: float = _BORDER_SPAN_FRAC
 ) -> str:
