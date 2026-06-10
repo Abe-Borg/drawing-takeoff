@@ -673,16 +673,21 @@ def main(argv: list[str] | None = None) -> int:
             )
         # Styles the LLM classified as NON-pipe (text/symbols/background) — surfaced,
         # not silently dropped; styles it was unsure about are flagged to confirm.
-        excluded_n = 0
-        excluded_lf = 0.0
+        excluded_n = excluded_lf = unreviewed_n = unreviewed_lf = 0
         for style, rs in runs_by.items():
             if not rs:
                 continue
             lab = style_labels.get(style)
             lf = sum(r.length_pt for r in rs) / ppf
-            if lab is not None and lab.trusted:
+            if lab is None:
+                # ranked below the --max-styles cap, so never shown to the LLM:
+                # NOT judged non-pipe. Surface separately so a pipe style down here
+                # isn't hidden inside the non-pipe total.
+                unreviewed_n += 1
+                unreviewed_lf += lf
+            elif lab.trusted:
                 continue  # confidently pipe -> counted
-            if lab is not None and lab.measurable:
+            elif lab.measurable:
                 # measurable but not trusted: maybe pipe, surfaced for confirmation,
                 # NOT auto-counted (so an unsure call can't inflate the total).
                 extra.append(f"STYLE TO CONFIRM (maybe pipe — NOT counted): {lab.system} "
@@ -692,6 +697,11 @@ def main(argv: list[str] | None = None) -> int:
                 excluded_lf += lf
         if excluded_n:
             extra.append(f"EXCLUDED as non-pipe by the style pass: {excluded_n} style(s) = {excluded_lf:,.0f} LF.")
+        if unreviewed_n:
+            extra.append(
+                f"NOT REVIEWED (ranked below the --max-styles cap of {args.max_styles}): "
+                f"{unreviewed_n} style(s) = {unreviewed_lf:,.0f} LF — raise --max-styles to classify them."
+            )
 
         report = build_system_size_report(nets, labels, geom, ppf=ppf)
         if extra:
