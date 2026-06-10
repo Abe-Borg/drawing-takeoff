@@ -263,3 +263,55 @@ class TakeoffResult:
     def flagged(self) -> list[TakeoffItem]:
         """Measurable but not trusted — surfaced for confirmation, not counted."""
         return [i for i in self.items if not i.trusted]
+
+
+@dataclass
+class SystemSizeSheet:
+    """One sheet's System×Size takeoff (M5–M7): the labeled pipe ``networks``
+    (kept so a marked-up PDF can be re-rendered from the original sheet) plus the
+    plain-data ``tables`` the Excel writer consumes and a human-readable ``report``.
+
+    ``networks`` holds :class:`Network` objects, so the only thing tying this back
+    to PyMuPDF is re-rendering the markup from ``source``/``page_index`` — the
+    tables and report are pure data.
+    """
+
+    sheet: str                                       # "<source>#p<page>"
+    source: str                                      # PDF path, for re-rendering the markup
+    page_index: int
+    networks: list = field(default_factory=list)     # list[Network]
+    tables: dict = field(default_factory=dict)       # by_system_size / detail / review
+    report: str = ""                                 # per-sheet human-readable report
+    notes: list[str] = field(default_factory=list)   # extra style-level review lines
+
+
+@dataclass
+class SystemSizeResult:
+    """Aggregated System×Size takeoff across a drawing set.
+
+    ``by_system_size`` sums the per-sheet ``{(system, size): LF}`` tables; the
+    per-sheet :class:`SystemSizeSheet` entries are retained so the export can
+    write one marked-up PDF per sheet. Mirrors :class:`TakeoffResult`'s
+    error/diagnostics discipline: one bad sheet never sinks the run.
+    """
+
+    by_system_size: dict[tuple[str, str], float] = field(default_factory=dict)
+    detail: list[dict] = field(default_factory=list)   # per-network rows (with a 'sheet' key)
+    review: list[str] = field(default_factory=list)     # all not-counted / confirm notes
+    sheets: list[SystemSizeSheet] = field(default_factory=list)
+    sheet_count: int = 0
+    errors: list[str] = field(default_factory=list)
+    diagnostics: list[str] = field(default_factory=list)
+
+    @property
+    def per_system_totals(self) -> dict[str, float]:
+        """LF rolled up by system (across sizes), high-to-low — the headline line."""
+        out: dict[str, float] = {}
+        for (system, _size), lf in self.by_system_size.items():
+            out[system] = out.get(system, 0.0) + lf
+        return {k: round(v, 1) for k, v in sorted(out.items(), key=lambda kv: -kv[1])}
+
+    def as_tables(self) -> dict:
+        """The plain-data shape :func:`drawing_takeoff.export.build_takeoff_workbook`
+        consumes — aggregated across every sheet in the set."""
+        return {"by_system_size": self.by_system_size, "detail": self.detail, "review": self.review}

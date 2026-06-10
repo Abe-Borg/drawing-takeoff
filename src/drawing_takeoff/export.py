@@ -163,16 +163,24 @@ def build_takeoff_workbook(tables: dict):
         ws.append(["(no trusted pipe networks)", "", ""])
 
     ws2 = wb.create_sheet("Detail")
-    ws2.append(["Network", "System", "Is Pipe", "Counted", "Confidence", "Ambiguous",
-                "Linear Feet", "% Page", "Sizes", "Reasoning"])
+    detail = tables.get("detail", [])
+    # A multi-sheet set tags each row with its sheet (network ids repeat per sheet);
+    # the single-sheet CLI export omits it, so the column only appears when needed.
+    has_sheet = any("sheet" in r for r in detail)
+    header = (["Sheet"] if has_sheet else []) + [
+        "Network", "System", "Is Pipe", "Counted", "Confidence", "Ambiguous",
+        "Linear Feet", "% Page", "Sizes", "Reasoning",
+    ]
+    ws2.append(header)
     for c in ws2[1]:
         c.font = bold
-    for r in tables.get("detail", []):
-        ws2.append([
+    for r in detail:
+        row = [
             r["network"], r["system"], "yes" if r["is_pipe"] else "no",
             "yes" if r["counted"] else "no", r["confidence"], "yes" if r["ambiguous"] else "no",
             r["linear_feet"], r["pct_page"], r["sizes"], r["reasoning"],
-        ])
+        ]
+        ws2.append(([r.get("sheet", "")] + row) if has_sheet else row)
 
     ws3 = wb.create_sheet("Review")
     ws3.append(["Review — confirm / not counted"])

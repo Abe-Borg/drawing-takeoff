@@ -27,10 +27,21 @@ The legend/labeling and full pipeline call Claude, so set `ANTHROPIC_API_KEY` fi
 # Name each lineweight's system and roll up trusted styles into a named takeoff:
 python -m drawing_takeoff.legend  SHEET.pdf [--legend LEAD_SHEET.pdf] [--discipline "fire protection"]
 
-# The GUI: drag in a set, confirm the scale, run, save the CSV
+# Roll trusted styles up by system AND size, with a marked-up PDF + Excel:
+python -m drawing_takeoff.legend  SHEET.pdf --system-size [--out DIR] \
+       [--legend LEAD_SHEET.pdf] [--top N] [--no-second-look]
+
+# The GUI: drag in a set, pick an output mode, confirm the scale, run, save
 pip install -e ".[gui]"      # customtkinter + tkinterdnd2
 python -m drawing_takeoff.gui
 ```
+
+The GUI exposes both engine paths and the same knobs as the CLI: an **output
+mode** (*by system* → CSV, or *by system × size* → pipe networks + sizes +
+second-look re-check, saved as an Excel workbook + a marked-up PDF per sheet), an
+optional advisory **legend** attachment, and the system×size tuning (top-N
+networks, max styles, second look). A set is taken end to end and totals roll up
+across every sheet.
 
 Headless, the engine is one call — PDFs in, a `TakeoffResult` out (per-system totals,
 flagged styles, per-sheet errors), with `export.write_takeoff_export(...)` for the CSVs:
@@ -66,9 +77,9 @@ src/drawing_takeoff/
   diagnose.py          # M1: go/no-go diagnostic report (pure; runs on models)
   measure.py           # M2: length primitives, run stitching, per-style footage
   legend.py            # M3: legend labeling via one structured Claude call (style -> system)
-  pipeline.py          # M4: extract_takeoff — geometry -> measure -> legend -> totals
-  export.py            # M4: takeoff CSV + diagnostics (pure builders + file writer)
-  gui.py               # M4: drag-drop front-end over extract_takeoff (needs [gui])
+  pipeline.py          # M4: extract_takeoff (by system) + extract_system_size_takeoff (M5-M8)
+  export.py            # M4/M8: takeoff CSV + diagnostics + System x Size Excel workbook
+  gui.py               # M4/M8: drag-drop front-end over both engine paths (needs [gui])
 tests/                 # hermetic harness (sentinel key + SDK fakes) + smoke/scale/measure/
                        #   diagnose + a PyMuPDF-gated geometry test (synthetic vector PDF)
 ```

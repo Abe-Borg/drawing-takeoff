@@ -7,11 +7,21 @@ exercised without a backend.
 from __future__ import annotations
 
 import json
+import re
+from pathlib import Path
 
 import pytest
 
 from drawing_takeoff import pipeline
-from drawing_takeoff.models import GeometryPath, SheetGeometry, SheetRef, StyleKey, TakeoffItem
+from drawing_takeoff.models import (
+    GeometryPath,
+    SheetGeometry,
+    SheetRef,
+    StyleKey,
+    SystemSizeResult,
+    SystemSizeSheet,
+    TakeoffItem,
+)
 from tests.fixtures.fake_anthropic import FakeClient, FakeMessage, FakeTextBlock
 
 
@@ -199,3 +209,117 @@ def test_aggregate_sums_trusted_across_sheets_only():
         _item("Duct", 30.0, "a#p0"),
     ]
     assert pipeline._aggregate(items) == {"Pipe": 150.0, "Duct": 30.0}
+
+
+# ---------------------------------------------------------------------------
+# System × Size pipeline (M5–M8): networks -> system -> size, aggregated
+# ---------------------------------------------------------------------------
+def _size_client():
+    """Fake client for the System×Size path: answers the style pass (s0 = pipe)
+    and the network pass (every network id the facts mention -> trusted pipe),
+    branching on which schema the request enforces."""
+
+    def responder(kw):
+        props = kw["output_config"]["format"]["schema"]["properties"]["labels"]["items"]["properties"]
+        if "style_id" in props:  # M3 style pass
+            return FakeMessage(content=[FakeTextBlock(text=json.dumps({"labels": [
+                {"style_id": "s0", "system": "FP sprinkler", "measurable": True,
+                 "confidence": "high", "ambiguous": False, "reasoning": "heavy black"},
+            ]}))])
+        # M7 network pass: read the ids straight from the per-network facts text.
+        text = " ".join(
+            b.get("text", "") for b in kw["messages"][0]["content"]
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+        ids = list(dict.fromkeys(re.findall(r"\bN\d+\b", text)))
+        return FakeMessage(content=[FakeTextBlock(text=json.dumps({"labels": [
+            {"network_id": nid, "system": "FP sprinkler", "is_pipe": True,
+             "confidence": "high", "ambiguous": False, "reasoning": "main"} for nid in ids
+        ]}))])
+
+    return FakeClient(responder)
+
+
+def test_absorb_sheet_sums_tags_and_prefixes():
+    # Pure aggregation: sum the System×Size tables, tag detail rows with their
+    # sheet, prefix review notes with the sheet id — no PyMuPDF, no client.
+    result = SystemSizeResult()
+    pipeline._absorb_sheet(result, SystemSizeSheet(
+        sheet="a#p0", source="a", page_index=0, networks=[1],
+        tables={"by_system_size": {("FP", '2"'): 10.0, ("FP", "unsized"): 5.0},
+                "detail": [{"network": "N0"}], "review": ["check N0"]},
+    ))
+    pipeline._absorb_sheet(result, SystemSizeSheet(
+        sheet="b#p0", source="b", page_index=0, networks=[1],
+        tables={"by_system_size": {("FP", '2"'): 4.0}, "detail": [{"network": "N0"}], "review": []},
+    ))
+    assert result.by_system_size[("FP", '2"')] == pytest.approx(14.0)
+    assert result.by_system_size[("FP", "unsized")] == pytest.approx(5.0)
+    assert {r["sheet"] for r in result.detail} == {"a#p0", "b#p0"}
+    assert result.review == ["a#p0: check N0"]
+    assert result.per_system_totals == {"FP": 19.0}
+    assert len(result.sheets) == 2
+
+
+def test_extract_system_size_takeoff_aggregates_across_sheets(tmp_path):
+    # End-to-end over two tiny real sheets (exact geometry + real network render),
+    # with the labels scripted: the per-sheet System×Size tables must sum into one
+    # set-wide total and every detail row must carry its sheet.
+    fitz = pytest.importorskip("fitz")
+
+    def make(path):
+        doc = fitz.open()
+        page = doc.new_page(width=216, height=144)
+        shape = page.new_shape()
+        shape.draw_line(fitz.Point(20, 50), fitz.Point(150, 50))  # one 130 pt run -> one network
+        shape.finish(color=(0, 0, 0), width=1.3)
+        shape.commit()
+        page.insert_text(fitz.Point(20, 20), '1/8" = 1\'-0"', fontsize=8)
+        doc.save(path)
+        doc.close()
+
+    paths = []
+    for n in range(2):
+        p = tmp_path / f"s{n}.pdf"
+        make(str(p))
+        paths.append(str(p))
+
+    result = pipeline.extract_system_size_takeoff(paths, client=_size_client())
+    assert result.sheet_count == 2 and not result.errors
+    assert ("FP sprinkler", "unsized") in result.by_system_size
+    per_sheet_lf = 130 / 9.0  # (150 - 20) pt at 9 pt/ft
+    assert result.per_system_totals["FP sprinkler"] == pytest.approx(2 * per_sheet_lf, rel=0.05)
+    assert len(result.sheets) == 2
+    assert result.detail and all("sheet" in row for row in result.detail)
+
+
+def test_extract_system_size_takeoff_records_bad_sheet_without_sinking_run(tmp_path):
+    # One unreadable PDF is captured in errors; the run still completes.
+    pytest.importorskip("fitz")
+    result = pipeline.extract_system_size_takeoff(
+        [str(tmp_path / "missing.pdf")], client=_size_client()
+    )
+    assert result.sheet_count == 0
+    assert any("could not read PDF" in e for e in result.errors)
+
+
+def test_write_system_size_export_writes_workbook_and_one_markup_per_sheet(tmp_path, monkeypatch):
+    # The Excel workbook always lands; a marked-up PDF is written per sheet that
+    # has networks (the markup render itself is stubbed — geometry is covered above).
+    pytest.importorskip("fitz")
+    import drawing_takeoff.geometry as _geom
+
+    def fake_markup(src, page_index, networks, out):
+        Path(out).write_bytes(b"%PDF-markup")
+
+    monkeypatch.setattr(_geom, "write_marked_up_pdf", fake_markup)
+
+    result = SystemSizeResult(sheet_count=1)
+    pipeline._absorb_sheet(result, SystemSizeSheet(
+        sheet="FP.pdf#p0", source="FP.pdf", page_index=0, networks=[object()],
+        tables={"by_system_size": {("FP", '2"'): 12.0}, "detail": [], "review": ["note"]},
+    ))
+    folder = pipeline.write_system_size_export(result, tmp_path)
+    assert (folder / "takeoff.xlsx").exists()
+    markups = sorted(p.name for p in folder.glob("*_markup.pdf"))
+    assert markups == ["FP_p0_markup.pdf"]

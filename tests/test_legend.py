@@ -260,6 +260,26 @@ def test_label_networks_routes_dense_sheets_to_opus():
     assert captured["model"] == "custom-model"
 
 
+def test_label_networks_uses_ppf_override_in_facts():
+    # A manual scale override (GUI/CLI) must drive the network facts the model
+    # reads, not the sheet's own detected scale — otherwise the size callouts the
+    # model weighs are snapped at the wrong scale. Regression for the PR #20 review.
+    geom = _net_geom()  # detected 9 pt/ft
+    nets = [_network("N0", ((0, 0), (180, 0)), ppf=18.0)]
+    captured = {}
+
+    def resp(kw):
+        captured["text"] = " ".join(
+            b.get("text", "") for b in kw["messages"][0]["content"] if b.get("type") == "text"
+        )
+        return _labels_message([
+            {"network_id": "N0", "system": "FP", "is_pipe": True,
+             "confidence": "high", "ambiguous": False, "reasoning": "x"}])
+
+    legend.label_networks(geom, nets, client=FakeClient(resp), ppf=18.0)
+    assert "18 pt/ft" in captured["text"] and "9 pt/ft" not in captured["text"]
+
+
 # ---- second look: close-up re-check of flagged networks -------------------
 def test_needs_second_look_policy():
     def lab(**kw):
