@@ -236,3 +236,19 @@ def test_takeoff_tables_detail_keeps_unsized_and_review_has_confirm():
     tables = legend.takeoff_tables([n0], labels, geom, ppf=9.0)
     assert '2"' in tables["detail"][0]["sizes"] and "unsized" in tables["detail"][0]["sizes"]
     assert any("CONFIRM" in r for r in tables["review"])
+
+
+def test_pipe_runs_from_style_labels_includes_only_trusted_pipe():
+    pipe_runs = measure.stitch_runs([_black((0, 0), (100, 0))], ppf=9.0)
+    text_runs = measure.stitch_runs([_line((0, 5), (8, 5), color=(0.0, 0.0, 0.0), width=0.24)], ppf=9.0)
+    maybe_runs = measure.stitch_runs([_line((0, 9), (60, 9), color=(0.70, 0.70, 0.70), width=0.24)], ppf=9.0)
+    runs_by = {pipe_runs[0].style_key: pipe_runs, text_runs[0].style_key: text_runs,
+               maybe_runs[0].style_key: maybe_runs}
+    style_labels = {
+        pipe_runs[0].style_key: SystemLabel(system="FP sprinkler", measurable=True, confidence="high"),
+        text_runs[0].style_key: SystemLabel(system="Text/labels", measurable=False, confidence="high"),
+        # measurable but ambiguous -> NOT trusted -> left out (surfaced to confirm,
+        # not silently inflating the takeoff).
+        maybe_runs[0].style_key: SystemLabel(system="maybe pipe", measurable=True, confidence="low", ambiguous=True),
+    }
+    assert legend.pipe_runs_from_style_labels(runs_by, style_labels) == pipe_runs
