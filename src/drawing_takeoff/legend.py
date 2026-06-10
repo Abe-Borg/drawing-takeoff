@@ -644,6 +644,21 @@ def second_look_networks(
     }
 
 
+def pipe_runs_from_style_labels(runs_by, style_labels):
+    """Union of runs from every style the LLM is **confident** is pipe (``trusted``
+    = measurable, not ambiguous, decent confidence) — the candidate set fed to
+    :func:`drawing_takeoff.measure.networks`. Style-spanning on purpose: mains and
+    branches in different pens all join in, replacing the single heaviest-dark
+    proxy. Styles it calls measurable-but-ambiguous are deliberately left OUT and
+    surfaced for confirmation rather than silently inflating the total."""
+    pipe = []
+    for style, rs in runs_by.items():
+        lab = style_labels.get(style)
+        if lab is not None and lab.trusted:
+            pipe.extend(rs)
+    return pipe
+
+
 _PAGE_SPAN_ADVISORY = 0.80
 
 
@@ -843,17 +858,27 @@ def main(argv: list[str] | None = None) -> int:
     geom = extract_pdf_geometry(args.pdf, pages=[args.page])[0]
 
     if args.system_size:
-        from .geometry import render_networks_png
+        from .geometry import render_networks_png, render_style_swatch
 
         ppf = geom.points_per_foot
         runs_by = measure.runs_by_style(geom, ppf=ppf, exclude_border=True)
-        pipe_style = measure.heaviest_dark_style(k for k, rs in runs_by.items() if rs)
-        pipe = runs_by.get(pipe_style, []) if pipe_style is not None else []
+
+        # Pass 1: the LLM picks which styles are pipe (vs text / symbols / background),
+        # so mains and branches in different pens all feed the takeoff — not just the
+        # single heaviest-dark pen.
+        cands = _candidates(geom, ppf=ppf, max_styles=args.max_styles)
+        swatches = {c.style_key: render_style_swatch(c.style_key) for c in cands}
+        style_labels = label_styles(geom, ppf=ppf, discipline=args.discipline,
+                                    style_images=swatches, max_styles=args.max_styles,
+                                    model=api_config.MODEL_SONNET_46)
+        pipe = pipe_runs_from_style_labels(runs_by, style_labels)
+        if not pipe:
+            print("No pipe styles identified on this sheet.")
+            return 0
+
+        # Pass 2: connect the pipe runs into systems and name them.
         all_nets = measure.networks(pipe, ppf=ppf)
         nets = all_nets[: args.top]
-        if not nets:
-            print("No pipe networks found on this sheet.")
-            return 0
         image = render_networks_png(args.pdf, args.page, nets)
         labels = label_networks(geom, nets, image=image, discipline=args.discipline)
 
@@ -867,7 +892,6 @@ def main(argv: list[str] | None = None) -> int:
             crops = {nw.id: render_network_crop_png(args.pdf, args.page, nw) for nw in flagged}
             labels.update(second_look_networks(geom, flagged, labels, crops, discipline=args.discipline))
 
-        # Footage outside the labeled set — surfaced, never silently dropped.
         extra: list[str] = []
         remainder = all_nets[args.top:]
         if remainder:
@@ -875,15 +899,36 @@ def main(argv: list[str] | None = None) -> int:
                 f"NOT LABELED: {len(remainder)} smaller networks beyond top {args.top} = "
                 f"{sum((nw.length_ft or 0.0) for nw in remainder):,.0f} LF (raise --top to include them)."
             )
-        other_n = other_lf = 0
-        for k, rs in runs_by.items():
-            if rs and k != pipe_style and k.stroke_color is not None and max(k.stroke_color) < 0.30 and (k.width or 0) > 0:
-                other_n += 1
-                other_lf += sum(r.length_pt for r in rs) / ppf
-        if other_n:
+        # Styles the LLM classified as NON-pipe (text/symbols/background) — surfaced,
+        # not silently dropped; styles it was unsure about are flagged to confirm.
+        excluded_n = excluded_lf = unreviewed_n = unreviewed_lf = 0
+        for style, rs in runs_by.items():
+            if not rs:
+                continue
+            lab = style_labels.get(style)
+            lf = sum(r.length_pt for r in rs) / ppf
+            if lab is None:
+                # ranked below the --max-styles cap, so never shown to the LLM:
+                # NOT judged non-pipe. Surface separately so a pipe style down here
+                # isn't hidden inside the non-pipe total.
+                unreviewed_n += 1
+                unreviewed_lf += lf
+            elif lab.trusted:
+                continue  # confidently pipe -> counted
+            elif lab.measurable:
+                # measurable but not trusted: maybe pipe, surfaced for confirmation,
+                # NOT auto-counted (so an unsure call can't inflate the total).
+                extra.append(f"STYLE TO CONFIRM (maybe pipe — NOT counted): {lab.system} "
+                             f"({lf:,.0f} LF) — {lab.reasoning or 'unsure if pipe'}")
+            else:
+                excluded_n += 1
+                excluded_lf += lf
+        if excluded_n:
+            extra.append(f"EXCLUDED as non-pipe by the style pass: {excluded_n} style(s) = {excluded_lf:,.0f} LF.")
+        if unreviewed_n:
             extra.append(
-                f"OTHER DARK LINEWEIGHTS not in this takeoff: {other_n} style(s) = {other_lf:,.0f} LF "
-                "(candidate is the heaviest-dark pen; confirm none is pipe — multi-style selection is future work)."
+                f"NOT REVIEWED (ranked below the --max-styles cap of {args.max_styles}): "
+                f"{unreviewed_n} style(s) = {unreviewed_lf:,.0f} LF — raise --max-styles to classify them."
             )
 
         report = build_system_size_report(nets, labels, geom, ppf=ppf)
