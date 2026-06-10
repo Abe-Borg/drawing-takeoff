@@ -58,8 +58,40 @@ class _FakeMessages:
         return self._responder(kwargs)
 
 
-class FakeClient:
-    """Duck-typed Anthropic client for ``client=`` injection in tests."""
+@dataclass
+class FakeFileObject:
+    id: str = "file_fake"
 
-    def __init__(self, responder: Callable[[dict], FakeMessage]) -> None:
+
+class _FakeFiles:
+    """Stand-in for ``client.beta.files``: records uploads/deletes."""
+
+    def __init__(self) -> None:
+        self.uploads: list[dict] = []
+        self.deleted: list[str] = []
+
+    def upload(self, **kwargs: Any) -> FakeFileObject:
+        self.uploads.append(kwargs)
+        return FakeFileObject(id=f"file_fake_{len(self.uploads)}")
+
+    def delete(self, file_id: str) -> None:
+        self.deleted.append(file_id)
+
+
+class _FakeBeta:
+    def __init__(self) -> None:
+        self.files = _FakeFiles()
+
+
+class FakeClient:
+    """Duck-typed Anthropic client for ``client=`` injection in tests.
+
+    ``with_files=True`` adds a ``beta.files`` fake (upload/delete recorders)
+    for code paths that use the Files API; the default omits it so fallback
+    paths (clients without a Files API) stay exercised.
+    """
+
+    def __init__(self, responder: Callable[[dict], FakeMessage], *, with_files: bool = False) -> None:
         self.messages = _FakeMessages(responder)
+        if with_files:
+            self.beta = _FakeBeta()

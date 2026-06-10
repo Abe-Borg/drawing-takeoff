@@ -45,6 +45,7 @@ def takeoff_for_sheet(
     scale_label: str | None = None,
     legend_image: bytes | None = None,
     legend_pdf: bytes | None = None,
+    legend_block: dict | None = None,
     discipline: str = "construction",
 ) -> tuple[list[TakeoffItem], list[str]]:
     """Measure + label one sheet into ``(items, diagnostics)``.
@@ -71,7 +72,8 @@ def takeoff_for_sheet(
     # *confidently* background is flagged for review, never guessed or discarded.
     labels = legend.label_styles(
         geom, client=client, ppf=ppf, discipline=discipline, legend_image=legend_image,
-        legend_pdf=legend_pdf, max_styles=min(max(len(feet), 1), _MAX_LABELLED_STYLES),
+        legend_pdf=legend_pdf, legend_block=legend_block,
+        max_styles=min(max(len(feet), 1), _MAX_LABELLED_STYLES),
     )
 
     def _item(style, lf, *, system, confidence, ambiguous, reasoning):
@@ -149,23 +151,45 @@ def extract_takeoff(
 
     total = len(sheets)
     result.sheet_count = total
-    for i, geom in enumerate(sheets):
-        if progress is not None:
-            progress(i, total, f"{Path(geom.ref.source).name} p{geom.ref.page_index}")
-        try:
-            items, diag = takeoff_for_sheet(
-                geom,
-                client=client,
-                scale_label=scale_label,
-                legend_image=legend_image,
-                legend_pdf=legend_pdf,
-                discipline=discipline,
+
+    # Multi-sheet sets reuse the legend: upload it once via the Files API and
+    # reference the file_id from every per-sheet request instead of re-sending
+    # the bytes each time. Transport only — the legend stays advisory either
+    # way. Any failure falls back to inline bytes (legend_block stays None).
+    legend_block = None
+    if (legend_pdf or legend_image) and total > 1:
+        if client is None:
+            from .client import get_client  # deferred: tests inject a fake
+
+            client = get_client()
+        legend_block = legend.upload_legend(client, legend_pdf=legend_pdf, legend_image=legend_image)
+        if legend_block is not None:
+            result.diagnostics.append(
+                f"legend uploaded once via Files API "
+                f"(file_id={legend_block['source']['file_id']}, reused on {total} sheets)"
             )
-            result.items.extend(items)
-            result.diagnostics.extend(diag)
-        except Exception as exc:
-            result.errors.append(str(exc))
-            result.diagnostics.append(f"{geom.ref.source}#p{geom.ref.page_index}: ERROR {exc}")
+
+    try:
+        for i, geom in enumerate(sheets):
+            if progress is not None:
+                progress(i, total, f"{Path(geom.ref.source).name} p{geom.ref.page_index}")
+            try:
+                items, diag = takeoff_for_sheet(
+                    geom,
+                    client=client,
+                    scale_label=scale_label,
+                    legend_image=legend_image,
+                    legend_pdf=legend_pdf,
+                    legend_block=legend_block,
+                    discipline=discipline,
+                )
+                result.items.extend(items)
+                result.diagnostics.extend(diag)
+            except Exception as exc:
+                result.errors.append(str(exc))
+                result.diagnostics.append(f"{geom.ref.source}#p{geom.ref.page_index}: ERROR {exc}")
+    finally:
+        legend.delete_uploaded_legend(client, legend_block)
 
     if progress is not None:
         progress(total, total, "done")

@@ -125,6 +125,67 @@ def test_scale_label_override_wins(geom):
     assert items[0].scale_used == pytest.approx(18.0)
 
 
+def test_takeoff_for_sheet_passes_legend_block_through(geom):
+    captured = {}
+
+    def responder(kw):
+        captured.update(kw)
+        return FakeMessage(content=[FakeTextBlock(text=json.dumps({"labels": [
+            {"style_id": "s0", "system": "Pipe", "measurable": True, "confidence": "high",
+             "ambiguous": False, "reasoning": ""}]}))])
+
+    block = {"type": "document", "source": {"type": "file", "file_id": "file_xyz"}}
+    pipeline.takeoff_for_sheet(geom, client=FakeClient(responder), legend_block=block)
+    assert block in captured["messages"][0]["content"]
+
+
+def test_extract_takeoff_uploads_legend_once_and_cleans_up(tmp_path):
+    # PyMuPDF-gated: two tiny synthetic sheets, one shared legend. The legend
+    # must upload ONCE, ride every per-sheet request as a file reference (not
+    # inline bytes), and be deleted when the run finishes.
+    fitz = pytest.importorskip("fitz")
+
+    paths = []
+    for n in range(2):
+        p = tmp_path / f"sheet{n}.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=216, height=144)
+        shape = page.new_shape()
+        shape.draw_line(fitz.Point(20, 50), fitz.Point(110, 50))
+        shape.finish(color=(0, 0, 0), width=1.3)
+        shape.commit()
+        page.insert_text(fitz.Point(20, 20), '1/8" = 1\'-0"', fontsize=8)
+        doc.save(p)
+        doc.close()
+        paths.append(str(p))
+
+    contents = []
+
+    def responder(kw):
+        contents.append(kw["messages"][0]["content"])
+        return FakeMessage(content=[FakeTextBlock(text=json.dumps({"labels": [
+            {"style_id": "s0", "system": "Pipe", "measurable": True, "confidence": "high",
+             "ambiguous": False, "reasoning": ""}]}))])
+
+    client = FakeClient(responder, with_files=True)
+    result = pipeline.extract_takeoff(paths, client=client, legend_pdf=b"%PDF-legend")
+    assert not result.errors
+    assert len(client.beta.files.uploads) == 1  # uploaded once, not per sheet
+    file_ids = set()
+    for content in contents:
+        file_blocks = [b for b in content
+                       if isinstance(b, dict) and (b.get("source") or {}).get("type") == "file"]
+        assert len(file_blocks) == 1  # reference attached, no inline PDF copy
+        file_ids.add(file_blocks[0]["source"]["file_id"])
+    assert len(file_ids) == 1
+    assert client.beta.files.deleted == sorted(file_ids)  # cleaned up after the run
+
+    # A single sheet skips the upload round trip and inlines the bytes.
+    single = FakeClient(responder, with_files=True)
+    pipeline.extract_takeoff(paths[:1], client=single, legend_pdf=b"%PDF-legend")
+    assert single.beta.files.uploads == []
+
+
 def _item(system, qty, sheet, *, conf="high", amb=False):
     return TakeoffItem(system, qty, "LF", sheet, StyleKey((0.0, 0.0, 0.0), 1.3, "[] 0"), 9.0,
                        confidence=conf, ambiguous=amb)

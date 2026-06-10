@@ -95,6 +95,18 @@ def test_render_page_png(synthetic_pdf):
     assert png[:8] == _PNG_MAGIC
 
 
+def test_render_network_crop_png(synthetic_pdf):
+    from drawing_takeoff import measure
+    from drawing_takeoff.models import Network
+
+    geom = geometry.extract_pdf_geometry(synthetic_pdf)[0]
+    runs_by = measure.runs_by_style(geom, ppf=geom.points_per_foot)
+    rs = max(runs_by.values(), key=lambda rs: sum(r.length_pt for r in rs))
+    nw = Network(id="N0", runs=tuple(rs), ppf=geom.points_per_foot)
+    png = geometry.render_network_crop_png(synthetic_pdf, 0, nw)
+    assert png[:8] == _PNG_MAGIC
+
+
 def test_image_file_to_png_normalizes(tmp_path):
     from drawing_takeoff.models import StyleKey
 

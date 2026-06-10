@@ -237,6 +237,37 @@ def render_networks_png(
         return page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False).tobytes("png")
 
 
+def render_network_crop_png(
+    pdf_path: str,
+    page_index: int,
+    network: Network,
+    *,
+    margin_pt: float = 72.0,
+    target_px: int = 1600,
+) -> bytes:
+    """High-DPI close-up of one network — the second-look render for M7.
+
+    The network is highlighted (thin, so tees and fittings stay visible under
+    the stroke) and the raster is clipped to its bbox plus ``margin_pt`` of
+    surrounding context. Scaling the *crop* to ``target_px`` is what buys the
+    resolution: a tight crop of an E-size sheet lands at many times the
+    whole-sheet render's effective DPI — enough to read branch connections and
+    nearby callouts that the global set-of-marks view blurs away.
+    """
+    with fitz.open(pdf_path) as doc:
+        page = doc[page_index]
+        color = _NETWORK_COLORS[0]
+        for run in network.runs:
+            pts = [fitz.Point(*p) for p in run.polyline]
+            if len(pts) >= 2:
+                page.draw_polyline(pts, color=color, width=2.0)
+        x0, y0, x1, y1 = network.bbox
+        clip = fitz.Rect(x0 - margin_pt, y0 - margin_pt, x1 + margin_pt, y1 + margin_pt) & page.rect
+        page.insert_text(fitz.Point(clip.x0 + 6, clip.y0 + 20), network.id, fontsize=16, color=color)
+        scale = target_px / max(clip.width, clip.height, 1.0)
+        return page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip, alpha=False).tobytes("png")
+
+
 def write_marked_up_pdf(pdf_path: str, page_index: int, networks: Sequence[Network], out_path: str) -> None:
     """Draw the given networks (colored + numbered) onto the sheet and save a new
     PDF — the marked-up takeoff an estimator opens, prints, and checks the colored
