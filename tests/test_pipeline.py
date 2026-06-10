@@ -284,12 +284,16 @@ def test_extract_system_size_takeoff_aggregates_across_sheets(tmp_path):
         make(str(p))
         paths.append(str(p))
 
-    result = pipeline.extract_system_size_takeoff(paths, client=_size_client())
+    logs: list[str] = []
+    result = pipeline.extract_system_size_takeoff(paths, client=_size_client(), log=logs.append)
     assert result.sheet_count == 2 and not result.errors
     assert ("FP sprinkler", "unsized") in result.by_system_size
     per_sheet_lf = 130 / 9.0  # (150 - 20) pt at 9 pt/ft
     assert result.per_system_totals["FP sprinkler"] == pytest.approx(2 * per_sheet_lf, rel=0.05)
     assert len(result.sheets) == 2
+    # The log sink streams sub-steps (a GUI shows these so a long run isn't "frozen");
+    # the per-sheet "labeling … with Claude…" line is what proves it's threaded through.
+    assert any("labeling" in m and "Claude" in m for m in logs)
     assert result.detail and all("sheet" in row for row in result.detail)
 
 
