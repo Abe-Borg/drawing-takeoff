@@ -267,6 +267,259 @@ def _parse_response(response, id_to_style: dict[str, StyleKey]) -> dict[StyleKey
     return out
 
 
+# ---------------------------------------------------------------------------
+# M7: label the M5 NETWORKS (generalizes label_styles), then join with M6 sizes
+# ---------------------------------------------------------------------------
+_NETWORK_SYSTEM_PROMPT = """\
+You are a quantity-takeoff assistant for construction drawings. You are given the connected line \
+NETWORKS the geometry engine found on one sheet — each network is a set of pipe runs joined end-to-end \
+or by tees ("follow the line"). Each network is drawn in its own color and labeled with its id \
+(N0, N1, ...) on the image, with exact geometry stats (linear feet, run count, how much of the sheet it \
+spans) and the pipe SIZES the drawing itself tags along it.
+
+The geometry and the sizes are GROUND TRUTH — never recompute or second-guess the numbers. For each \
+network decide:
+  - `system`: the building system it carries (e.g. "Fire-protection sprinkler", "Standpipe", \
+"Domestic cold water"); use "Matchline / non-pipe" for a network that is not pipe.
+  - `is_pipe`: true only if it is real pipe a length takeoff should count. A network spanning most of \
+the sheet with almost no branches is likely a MATCHLINE or border (is_pipe false); a network with branch \
+lines teeing off a main, or with pipe sizes tagged along it, is real pipe.
+  - `confidence` (high/medium/low). Set `ambiguous` true and `confidence` low when you cannot \
+confidently place it — for example a long sheet-spanning network you are unsure is a main vs a matchline. \
+A human reviews every ambiguous or low-confidence network, so flag rather than guess.
+  - `reasoning`: one sentence citing what you saw.
+
+Call `record_network_labels` exactly once, with one entry for every network id given."""
+
+_NETWORK_TOOL = {
+    "name": "record_network_labels",
+    "description": "Record the building system and measurability of each numbered network on the sheet.",
+    "strict": True,
+    "input_schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "labels": {
+                "type": "array",
+                "description": "One entry per network id given in the prompt.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "network_id": {"type": "string"},
+                        "system": {
+                            "type": "string",
+                            "description": "System name; 'Matchline / non-pipe' for non-pipe linework.",
+                        },
+                        "is_pipe": {"type": "boolean", "description": "True only for real pipe to be totaled."},
+                        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                        "ambiguous": {
+                            "type": "boolean",
+                            "description": "True if you could not confidently place it; flagged for review.",
+                        },
+                        "reasoning": {"type": "string"},
+                    },
+                    "required": ["network_id", "system", "is_pipe", "confidence", "ambiguous", "reasoning"],
+                },
+            }
+        },
+        "required": ["labels"],
+    },
+}
+
+
+def network_facts(geometry: SheetGeometry, networks, *, ppf: float | None = None, discipline: str = "construction") -> str:
+    """Pure text the model reads beside the numbered image: per network, exact LF /
+    run count / page span and the M6 size mix (the drawing's own callouts)."""
+    if ppf is None:
+        ppf = geometry.points_per_foot
+    pw, ph = geometry.page_width_pt, geometry.page_height_pt
+    lines = [
+        f"Discipline: {discipline}. Scale: {geometry.scale_label or 'unknown'}"
+        + (f" ({ppf:g} pt/ft)." if ppf else "."),
+        f"{len(networks)} connected pipe networks, each drawn in its own color and labeled with its id "
+        "on the image.",
+        "Per network (geometry is exact; sizes are the drawing's own callouts snapped to each run):",
+    ]
+    for nw in networks:
+        x0, y0, x1, y1 = nw.bbox
+        pg = 100.0 * max((x1 - x0) / pw, (y1 - y0) / ph) if pw and ph else 0.0
+        by = measure.linear_feet_by_size(nw.runs, geometry, ppf=ppf) if ppf else {}
+        sized = ", ".join(
+            f"{measure.size_label(s)}={v:.0f}LF"
+            for s, v in sorted((k, v) for k, v in by.items() if k is not None)
+        )
+        unsized = by.get(None, 0.0)
+        lf = nw.length_ft if nw.length_ft is not None else nw.length_pt
+        lines.append(
+            f"  {nw.id}: {lf:.0f} LF, {nw.run_count} runs, spans {pg:.0f}% of page; "
+            f"sizes: {sized or '(none tagged)'}" + (f", unsized={unsized:.0f}LF" if unsized else "")
+        )
+    return "\n".join(lines)
+
+
+def label_networks(
+    geometry: SheetGeometry,
+    networks,
+    *,
+    client=None,
+    image: bytes | None = None,
+    discipline: str = "construction",
+    model: str | None = None,
+) -> dict[str, SystemLabel]:
+    """Map each network id to a :class:`SystemLabel` via one forced tool call.
+
+    Generalizes :func:`label_styles` to M5 networks: the model gets the numbered
+    set-of-marks ``image`` plus the per-network facts and returns, per id, the
+    system and whether it's real pipe (``measurable``) — keyed on the engine's
+    network ids, so its labels bind back to exact geometry. It supplies no
+    numbers. Defaults to Sonnet 4.6, which the M7 probe validated for this
+    vision+reasoning task at a fraction of Opus's cost; pass ``model`` to change.
+    Networks the model omits default to an ambiguous, non-measurable label.
+    """
+    networks = list(networks)
+    if not networks:
+        return {}
+    if model is None:
+        model = api_config.MODEL_SONNET_46
+    if client is None:
+        from .client import get_client
+
+        client = get_client()
+
+    content: list[dict] = [{"type": "text", "text": network_facts(geometry, networks, discipline=discipline)}]
+    if image:
+        content.append({"type": "text", "text": "The sheet, with each network drawn in its color and labeled with its id:"})
+        content.append(_image_block(image))
+    content.append({"type": "text", "text": "Call record_network_labels once, with one entry for every network id above."})
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=_MAX_TOKENS,
+        system=_NETWORK_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": content}],
+        tools=[_NETWORK_TOOL],
+        tool_choice={"type": "tool", "name": "record_network_labels"},
+    )
+    return _parse_network_response(response, networks)
+
+
+def _parse_network_response(response, networks) -> dict[str, SystemLabel]:
+    ids = {nw.id for nw in networks}
+    out: dict[str, SystemLabel] = {}
+    for block in getattr(response, "content", []) or []:
+        if getattr(block, "type", None) != "tool_use" or getattr(block, "name", None) != "record_network_labels":
+            continue
+        for item in (getattr(block, "input", {}) or {}).get("labels", []):
+            nid = item.get("network_id")
+            if nid not in ids:
+                continue
+            out[nid] = SystemLabel(
+                system=str(item.get("system", "")).strip() or "(unnamed)",
+                measurable=bool(item.get("is_pipe", False)),
+                confidence=str(item.get("confidence", "low")).lower(),
+                ambiguous=bool(item.get("ambiguous", False)),
+                reasoning=item.get("reasoning"),
+            )
+    for nw in networks:
+        out.setdefault(
+            nw.id,
+            SystemLabel(system="(unlabeled)", measurable=False, confidence="low", ambiguous=True,
+                        reasoning="No label returned for this network."),
+        )
+    return out
+
+
+_PAGE_SPAN_ADVISORY = 0.80
+
+
+def system_size_takeoff(
+    networks,
+    labels: dict[str, SystemLabel],
+    geometry: SheetGeometry,
+    *,
+    ppf: float,
+    radius_ft: float = measure._DEFAULT_SIZE_RADIUS_FT,
+) -> tuple[dict[tuple[str, str], float], list[str]]:
+    """Join network->system (M7) with run->size (M6) into a System x Size LF table.
+
+    Only **trusted** pipe networks (measurable, not ambiguous, confident) roll
+    into the totals; a non-pipe (matchline) network is excluded with a note, and
+    an ambiguous / low-confidence one is routed to the review list rather than
+    counted. Returns ``(by_system_size, review_notes)``. The LLM supplied only
+    labels, so every LF here traces back to exact geometry.
+    """
+    by: dict[tuple[str, str], float] = {}
+    review: list[str] = []
+    for nw in networks:
+        lf = nw.length_ft if nw.length_ft is not None else (nw.length_pt / ppf)
+        label = labels.get(nw.id)
+        if label is None or not label.measurable:
+            why = "no label returned" if label is None else f"non-pipe ({label.system})"
+            review.append(
+                f"{nw.id}: excluded — {why} — {lf:,.0f} LF"
+                + (f" [{label.reasoning}]" if label is not None and label.reasoning else "")
+            )
+            continue
+        if not label.trusted:
+            review.append(
+                f"{nw.id}: {label.system} flagged "
+                f"({label.confidence}{', ambiguous' if label.ambiguous else ''}) — {lf:,.0f} LF"
+            )
+            continue
+        for size, slf in measure.linear_feet_by_size(nw.runs, geometry, ppf=ppf, radius_ft=radius_ft).items():
+            key = (label.system, measure.size_label(size) if size is not None else "unsized")
+            by[key] = by.get(key, 0.0) + slf
+    return by, review
+
+
+def build_system_size_report(
+    networks,
+    labels: dict[str, SystemLabel],
+    geometry: SheetGeometry,
+    *,
+    ppf: float | None = None,
+    radius_ft: float = measure._DEFAULT_SIZE_RADIUS_FT,
+) -> str:
+    """M7 deliverable: the System x Size linear-feet table + a review list."""
+    if ppf is None:
+        ppf = geometry.points_per_foot
+    head = f"=== M7 takeoff: {geometry.ref.source} (page {geometry.ref.page_index}) ==="
+    if not ppf:
+        return head + "\n  no scale on sheet; cannot compute footage"
+
+    by, review = system_size_takeoff(networks, labels, geometry, ppf=ppf, radius_ft=radius_ft)
+    systems: dict[str, dict[str, float]] = {}
+    for (system, size), lf in by.items():
+        systems.setdefault(system, {})[size] = lf
+
+    lines = [head, "", "TAKEOFF — linear feet by system and size (trusted pipe networks):"]
+    if systems:
+        label_to_in = {v: k for k, v in measure._SIZE_LABEL.items()}
+        for system in sorted(systems, key=lambda s: -sum(systems[s].values())):
+            lines.append(f"  {system}: {sum(systems[system].values()):,.1f} LF")
+            for size, lf in sorted(systems[system].items(), key=lambda kv: label_to_in.get(kv[0], 1e9)):
+                lines.append(f"      {size:>10s}  {lf:>9,.1f} LF")
+    else:
+        lines.append("  (no trusted pipe networks)")
+
+    # Counted networks that span ~the whole sheet are worth a human glance (a long
+    # main and a matchline both span the sheet; the model judged this one pipe).
+    pw, ph = geometry.page_width_pt, geometry.page_height_pt
+    spanning = []
+    for nw in networks:
+        lab = labels.get(nw.id)
+        if lab is not None and lab.trusted and pw and ph:
+            x0, y0, x1, y1 = nw.bbox
+            if max((x1 - x0) / pw, (y1 - y0) / ph) >= _PAGE_SPAN_ADVISORY:
+                spanning.append(f"{nw.id} ({lab.system})")
+    if spanning:
+        lines += ["", "CONFIRM (counted, but span ~the whole sheet — main vs matchline): " + ", ".join(spanning)]
+    if review:
+        lines += ["", "REVIEW (not counted):"] + [f"  {r}" for r in review]
+    return "\n".join(lines)
+
+
 def _load_legend_image(path: str, page: int) -> bytes:
     """Read a legend image (any common raster) or rasterize a legend PDF page.
 
@@ -304,6 +557,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--legend-page", type=int, default=0)
     ap.add_argument("--discipline", default="construction", help='e.g. "fire protection", "plumbing", "HVAC"')
     ap.add_argument("--max-styles", type=int, default=12)
+    ap.add_argument("--system-size", action="store_true",
+                    help="M7: label the connected networks and print the System x Size takeoff")
+    ap.add_argument("--top", type=int, default=8, help="largest N networks to label (with --system-size)")
     args = ap.parse_args(argv)
 
     if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
@@ -314,6 +570,47 @@ def main(argv: list[str] | None = None) -> int:
     from .geometry import extract_pdf_geometry, render_style_swatch
 
     geom = extract_pdf_geometry(args.pdf, pages=[args.page])[0]
+
+    if args.system_size:
+        from .geometry import render_networks_png
+
+        ppf = geom.points_per_foot
+        runs_by = measure.runs_by_style(geom, ppf=ppf, exclude_border=True)
+        pipe_style = measure.heaviest_dark_style(k for k, rs in runs_by.items() if rs)
+        pipe = runs_by.get(pipe_style, []) if pipe_style is not None else []
+        all_nets = measure.networks(pipe, ppf=ppf)
+        nets = all_nets[: args.top]
+        if not nets:
+            print("No pipe networks found on this sheet.")
+            return 0
+        image = render_networks_png(args.pdf, args.page, nets)
+        labels = label_networks(geom, nets, image=image, discipline=args.discipline)
+        report = build_system_size_report(nets, labels, geom, ppf=ppf)
+        remainder = all_nets[args.top:]
+        if remainder:
+            rem_lf = sum((nw.length_ft or 0.0) for nw in remainder)
+            report += (
+                f"\n\nNOT LABELED: {len(remainder)} smaller networks beyond top {args.top} "
+                f"= {rem_lf:,.0f} LF (raise --top to include them; never silently dropped)."
+            )
+        # The candidate set is the single heaviest-dark pen, so pipe drawn with a
+        # second (thinner) dark pen would otherwise vanish. Surface other dark
+        # lineweights rather than drop them silently — much is text/symbols, but a
+        # human (or, later, the LLM picking the real pipe styles) confirms.
+        other_n = other_lf = 0
+        for k, rs in runs_by.items():
+            if rs and k != pipe_style and k.stroke_color is not None and max(k.stroke_color) < 0.30 and (k.width or 0) > 0:
+                other_n += 1
+                other_lf += sum(r.length_pt for r in rs) / ppf
+        if other_n:
+            report += (
+                f"\n\nOTHER DARK LINEWEIGHTS not in this takeoff: {other_n} style(s) = {other_lf:,.0f} LF. "
+                "The candidate set is the single heaviest-dark pen; much of this is text/symbols, but "
+                "confirm none is pipe (multi-style pipe selection is future M7 work)."
+            )
+        print(report)
+        return 0
+
     ppf = geom.points_per_foot
     cands = _candidates(geom, ppf=ppf, max_styles=args.max_styles)
     if not cands:

@@ -1,8 +1,8 @@
 # Design draft: binding measurement to meaning (the bucketing layer)
 
-> **Status: M5–M6 shipped; M7–M8 are design.** M5 (connectivity → networks) and M6 (pipe sizes)
-> are implemented and validated on the real sheets (§8); the rest is a plan to react to and poke
-> holes in. Sections 9–10 are the open questions and risks. It extends the shipped POC (M1–M4; see `README.md`) with the
+> **Status: M5–M7 shipped; M8 is design.** M5 (networks), M6 (pipe sizes), and M7 (LLM system
+> labeling → System × Size) are implemented and validated on the real sheets (§8); M8 (output) is
+> a plan to react to and poke holes in. Sections 9–10 are the open questions and risks. It extends the shipped POC (M1–M4; see `README.md`) with the
 > classification/bucketing layer the POC deliberately stubbed.
 
 ## 1. Context — the gap this closes
@@ -189,11 +189,23 @@ and hermetic tests. **Caveat:** bare integers (`1`, `6`) are less certain than t
 `1¼`/`1½` — a detail digit near a pipe could mis-size. The size-set + adjacency filter limits it,
 M7's LLM does the final normalization, and the per-network total stays exact regardless.
 
-### M7 — LLM legend reconstruction (LLM enters, generalized M3)
-**Objective:** label networks/symbols from context, keyed on engine IDs, notation normalized.
-**Build (`legend.py`):** the §4 facts object + set-of-marks renders; the §5 tool contract;
-optional agentic tools. **Exit:** correct system+component labels on the sample set incl. an
-*absent/contradictory* legend; ambiguous → flagged, not guessed; **the LLM emits no numbers.**
+### M7 — LLM legend reconstruction (LLM enters) — VALIDATED & SHIPPED
+**Probe → build:** one Claude call per sheet (Sonnet 4.6, ~2¢) labels the numbered networks and
+returns, per id, the system + is_pipe + confidence/ambiguous — keyed on engine ids, **no numbers**.
+A single forced tool call sufficed (no agentic loop needed for these sheets). Code then joins
+network→system (M7) with run→size (M6) into the **System × Size** table.
+**Result on the real sheets:** FP2.20 → one "Fire-protection sprinkler" system, 1,234.6 LF split
+1"/1¼"/1½"/2"/4"/6" (+ unsized, + a 170 LF "not labeled" remainder, never dropped). FP2.21 → the
+model correctly split the long N1 into a distinct "main/standpipe feed", and the CONFIRM advisory
+flagged both page-spanning networks for a human glance — the geometry-proposes / LLM-adjudicates /
+human-confirms split the design rests on (it overrode M5's crude `%page` "matchline?" flag using
+M6's size evidence).
+**Shipped:** `geometry.render_networks_png` (set-of-marks), `legend.network_facts` /
+`label_networks` (forced tool call → `SystemLabel` per id) / `system_size_takeoff` /
+`build_system_size_report`, a `legend --system-size` CLI, and hermetic tests (fake client).
+**Open:** system-name normalization (FP2.21 split one discipline into two near-identical names);
+single-discipline sheets keep the system axis uniform, so cross-system discrimination still wants a
+mixed-discipline sheet to prove out.
 
 ### M8 — Marked-up PDF + Excel + review loop
 **Objective:** outputs an estimator trusts and can correct. **Build:** overlay renderer (in

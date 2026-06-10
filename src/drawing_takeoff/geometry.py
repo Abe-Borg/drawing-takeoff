@@ -16,7 +16,7 @@ from typing import Iterable, Sequence
 import fitz  # PyMuPDF (AGPL-3.0) — confined to this module by design.
 
 from . import scale as _scale
-from .models import GeometryPath, SheetGeometry, SheetRef, TextWord
+from .models import GeometryPath, Network, SheetGeometry, SheetRef, TextWord
 
 # PyMuPDF path-type code -> our ``kind``.
 _KIND = {"s": "stroke", "f": "fill", "fs": "both"}
@@ -183,3 +183,38 @@ def render_page_png(
         clip_rect = fitz.Rect(*clip) if clip is not None else None
         pix = page.get_pixmap(matrix=mat, clip=clip_rect, alpha=False)
         return pix.tobytes("png")
+
+
+# Fixed palette so a network keeps the same color across the image (and any caption).
+_NETWORK_COLORS = [
+    (0.85, 0.10, 0.10), (0.10, 0.35, 0.90), (0.10, 0.62, 0.20), (0.95, 0.55, 0.05),
+    (0.60, 0.15, 0.80), (0.00, 0.65, 0.68), (0.90, 0.10, 0.55), (0.50, 0.45, 0.05),
+]
+
+
+def render_networks_png(
+    pdf_path: str,
+    page_index: int,
+    networks: Sequence[Network],
+    *,
+    target_px: int = 2400,
+) -> bytes:
+    """Render the sheet with each given network drawn in its own color and labeled
+    with its id — a *set-of-marks* overlay for the M7 recognition step.
+
+    The model points by the engine's network id (drawn on the image), so its
+    labels bind straight back to exact geometry. The caller passes the networks to
+    show (normally the largest few); colors cycle through ``_NETWORK_COLORS``.
+    """
+    with fitz.open(pdf_path) as doc:
+        page = doc[page_index]
+        for i, nw in enumerate(networks):
+            color = _NETWORK_COLORS[i % len(_NETWORK_COLORS)]
+            for run in nw.runs:
+                pts = [fitz.Point(*p) for p in run.polyline]
+                if len(pts) >= 2:
+                    page.draw_polyline(pts, color=color, width=5.0)
+            x0, y0, _, _ = nw.bbox
+            page.insert_text(fitz.Point(x0, max(y0 + 22, 26)), nw.id, fontsize=34, color=color)
+        scale = target_px / max(page.rect.width, page.rect.height)
+        return page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False).tobytes("png")
