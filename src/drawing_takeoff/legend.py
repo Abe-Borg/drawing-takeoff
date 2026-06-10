@@ -593,6 +593,21 @@ def main(argv: list[str] | None = None) -> int:
                 f"\n\nNOT LABELED: {len(remainder)} smaller networks beyond top {args.top} "
                 f"= {rem_lf:,.0f} LF (raise --top to include them; never silently dropped)."
             )
+        # The candidate set is the single heaviest-dark pen, so pipe drawn with a
+        # second (thinner) dark pen would otherwise vanish. Surface other dark
+        # lineweights rather than drop them silently — much is text/symbols, but a
+        # human (or, later, the LLM picking the real pipe styles) confirms.
+        other_n = other_lf = 0
+        for k, rs in runs_by.items():
+            if rs and k != pipe_style and k.stroke_color is not None and max(k.stroke_color) < 0.30 and (k.width or 0) > 0:
+                other_n += 1
+                other_lf += sum(r.length_pt for r in rs) / ppf
+        if other_n:
+            report += (
+                f"\n\nOTHER DARK LINEWEIGHTS not in this takeoff: {other_n} style(s) = {other_lf:,.0f} LF. "
+                "The candidate set is the single heaviest-dark pen; much of this is text/symbols, but "
+                "confirm none is pipe (multi-style pipe selection is future M7 work)."
+            )
         print(report)
         return 0
 
