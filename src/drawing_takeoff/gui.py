@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 import traceback
+from datetime import datetime
 from pathlib import Path
 
 from . import export, legend
@@ -77,6 +79,12 @@ if _GUI:
             self._mode = "system"
             self._result = None
             self._events: "queue.Queue[tuple]" = queue.Queue()
+            # Heartbeat state for the activity log + ticking-elapsed headline.
+            self._running = False
+            self._done = 0
+            self._total = 0
+            self._step_text = ""
+            self._step_t0: float | None = None
 
             pad = {"padx": 10, "pady": 6}
 
@@ -174,8 +182,20 @@ if _GUI:
 
             self._status = ctk.CTkLabel(self, text="Add sheets and confirm the scale.", anchor="w")
             self._status.pack(fill="x", padx=16)
-            self._results = ctk.CTkTextbox(self)
-            self._results.pack(fill="both", expand=True, **pad)
+
+            # --- activity log ---------------------------------------------
+            # A live, timestamped log streamed from the worker. The engine's
+            # slow step is a single blocking Claude vision call per sheet; with
+            # only a static status line the window looked frozen during it. The
+            # log shows each sub-step as it happens, and the headline above ticks
+            # an elapsed-seconds counter, so a long call reads as working, not
+            # hung. The final takeoff summary is appended here when the run ends.
+            log_head = ctk.CTkFrame(self)
+            log_head.pack(fill="x", **pad)
+            ctk.CTkLabel(log_head, text="Activity log").pack(side="left", padx=6)
+            ctk.CTkButton(log_head, text="Copy log", width=80, command=self._copy_log).pack(side="right", padx=4)
+            self._logbox = ctk.CTkTextbox(self)
+            self._logbox.pack(fill="both", expand=True, **pad)
 
         # ----- mode ------------------------------------------------------
         def _on_mode(self, value: str) -> None:
@@ -250,9 +270,11 @@ if _GUI:
             key = self._key.get().strip()
             if key:
                 os.environ["ANTHROPIC_API_KEY"] = key
+            scale = self._scale.get().strip() or None
+            disc = self._discipline.get().strip() or "construction"
             self._run_btn.configure(state="disabled")
             self._save_btn.configure(state="disabled")
-            self._results.delete("1.0", "end")
+            self._logbox.delete("1.0", "end")
             self._progress.set(0)
             scale = self._scale.get().strip() or None
             disc = self._discipline.get().strip() or "construction"
@@ -302,22 +324,70 @@ if _GUI:
                     evt = self._events.get_nowait()
                     if evt[0] == "progress":
                         _, done, total, label = evt
+                        self._done, self._total = done, total
                         self._progress.set(done / total if total else 0)
-                        self._status.configure(text=f"[{done}/{total}] {label}")
+                        self._set_step(label)
+                    elif evt[0] == "log":
+                        self._log_line(evt[1])
+                        self._set_step(evt[1])
                     elif evt[0] == "done":
                         self._finish(evt[1])
                         return
                     elif evt[0] == "error":
-                        self._status.configure(text="Failed.")
-                        self._results.insert("end", evt[1])
+                        self._running = False
+                        self._status.configure(text="Failed — see the log below.")
+                        self._log_line("ERROR — the run did not finish:")
+                        self._logbox.insert("end", evt[1].rstrip() + "\n")
+                        self._logbox.see("end")
                         self._run_btn.configure(state="normal")
                         return
             except queue.Empty:
                 pass
-            self.after(100, self._drain)
+            # Re-arm even when idle so the elapsed-seconds headline keeps ticking
+            # through the long, event-less Claude vision call (the "frozen" gap).
+            self._refresh_status()
+            self.after(200, self._drain)
+
+        # ----- log + heartbeat -------------------------------------------
+        def _log_line(self, message: str) -> None:
+            """Append one timestamped line to the activity log and scroll to it."""
+            self._logbox.insert("end", f"[{datetime.now():%H:%M:%S}] {message}\n")
+            self._logbox.see("end")
+
+        def _set_step(self, text: str) -> None:
+            """Make ``text`` the current-step headline and restart its timer."""
+            self._step_text = text
+            self._step_t0 = time.monotonic()
+            self._refresh_status()
+
+        def _refresh_status(self) -> None:
+            """Redraw the headline as ``[done/total] step  (Ns)``. The ticking
+            elapsed time is the proof-of-life while a sheet's vision call runs."""
+            if not self._running:
+                return
+            prefix = f"[{self._done}/{self._total}] " if self._total else ""
+            step = self._step_text if len(self._step_text) <= 88 else self._step_text[:87] + "…"
+            elapsed = ""
+            if self._step_t0 is not None:
+                secs = time.monotonic() - self._step_t0
+                if secs >= 1.0:
+                    elapsed = f"  ({secs:.0f}s)"
+            self._status.configure(text=f"{prefix}{step}{elapsed}")
+
+        def _copy_log(self) -> None:
+            """Copy the whole activity log to the clipboard (handy for sharing
+            an error trace or the run's diagnostics)."""
+            try:
+                self.clipboard_clear()
+                self.clipboard_append(self._logbox.get("1.0", "end").rstrip())
+                if not self._running:
+                    self._status.configure(text="Activity log copied to clipboard.")
+            except Exception:
+                pass
 
         def _finish(self, result) -> None:
             self._result = result
+            self._running = False
             self._run_btn.configure(state="normal")
             self._save_btn.configure(state="normal")
             self._progress.set(1)
