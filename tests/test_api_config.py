@@ -67,6 +67,25 @@ def test_client_without_models_api_does_not_burn_the_attempt():
     assert api_config.model_capabilities(model).supports_effort
 
 
+def test_registration_tolerates_typed_capability_objects():
+    # The capability tree is documented as a plain dict, but a future SDK
+    # release could model it; attribute-style nodes must read identically
+    # rather than silently registering the model as capability-less.
+    model = "claude-test-live-5"
+    record = SimpleNamespace(
+        max_tokens=64_000,
+        max_input_tokens=200_000,
+        capabilities=SimpleNamespace(
+            thinking=SimpleNamespace(types=SimpleNamespace(adaptive=SimpleNamespace(supported=True))),
+            effort=SimpleNamespace(supported=True, xhigh=SimpleNamespace(supported=False)),
+        ),
+    )
+    api_config.ensure_model_registered(model, client=_models_client(record))
+    caps = api_config.model_capabilities(model)
+    assert caps.supports_adaptive_thinking and caps.supports_effort
+    assert caps.supports_effort_xhigh is False
+
+
 def test_known_models_never_hit_the_models_api():
     client = _models_client(fail=True)  # would raise if consulted
     api_config.ensure_model_registered(api_config.MODEL_OPUS_48, client=client)

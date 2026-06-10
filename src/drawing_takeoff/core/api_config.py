@@ -411,19 +411,23 @@ _LIVE_LOOKUP_ATTEMPTED: set[str] = set()
 def _capabilities_from_models_api(info) -> ModelCapabilities:
     """Map a Models API record onto :class:`ModelCapabilities`.
 
-    ``info.capabilities`` is the API's untyped nested dict with a
-    ``supported`` bool at each leaf; a missing branch reads as unsupported.
+    ``info.capabilities`` is documented as an untyped nested dict with a
+    ``supported`` bool at each leaf, but the walker also tolerates typed
+    SDK objects (attribute access) at any level — if a future SDK release
+    models the tree, the failure mode would otherwise be silently recording
+    every live model as capability-less, the exact degradation this path
+    exists to prevent. A missing branch reads as unsupported either way.
     The 300k extended-output batch beta is not discoverable here, so it stays
     off — strictly safer (the request simply won't ask for extended output).
     """
-    tree = dict(info.capabilities or {})
+    tree = info.capabilities or {}
 
     def supported(*path: str) -> bool:
         node: object = tree
         for key in (*path, "supported"):
-            if not isinstance(node, dict):
+            node = node.get(key) if isinstance(node, dict) else getattr(node, key, None)
+            if node is None:
                 return False
-            node = node.get(key)
         return bool(node)
 
     return ModelCapabilities(
