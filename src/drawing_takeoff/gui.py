@@ -276,8 +276,6 @@ if _GUI:
             self._save_btn.configure(state="disabled")
             self._logbox.delete("1.0", "end")
             self._progress.set(0)
-            scale = self._scale.get().strip() or None
-            disc = self._discipline.get().strip() or "construction"
             legend_path = self._legend.get().strip() or None
             opts = {
                 "legend_path": legend_path,
@@ -286,6 +284,17 @@ if _GUI:
                 "max_styles": self._int(self._max_styles, 12),
                 "second_look": bool(self._second_look.get()),
             }
+            # Heartbeat state so the activity log streams and the headline ticks an
+            # elapsed-seconds counter through the long, event-less Claude call.
+            self._running = True
+            self._done = self._total = 0
+            self._set_step("Starting…")
+            self._log_line(
+                f"Run started — {self._mode} mode, {len(self._pdfs)} file(s), "
+                f"discipline: {disc}, scale: {scale or 'auto-detect'}"
+                + (f", legend: {Path(legend_path).name}" if legend_path else "")
+                + "."
+            )
             threading.Thread(
                 target=self._worker, args=(list(self._pdfs), scale, disc, self._mode, opts), daemon=True
             ).start()
@@ -296,6 +305,9 @@ if _GUI:
                 def progress(done, total, label):
                     self._events.put(("progress", done, total, label))
 
+                def log(message):
+                    self._events.put(("log", message))
+
                 legend_pdf = legend_image = None
                 if opts["legend_path"]:
                     kind, data = legend._load_legend_attachment(opts["legend_path"], opts["legend_page"])
@@ -305,13 +317,13 @@ if _GUI:
                 client = get_client()
                 if mode == "size":
                     result = extract_system_size_takeoff(
-                        pdfs, client=client, progress=progress, scale_label=scale, discipline=discipline,
+                        pdfs, client=client, progress=progress, log=log, scale_label=scale, discipline=discipline,
                         legend_pdf=legend_pdf, legend_image=legend_image,
                         top=opts["top"], max_styles=opts["max_styles"], second_look=opts["second_look"],
                     )
                 else:
                     result = extract_takeoff(
-                        pdfs, client=client, progress=progress, scale_label=scale, discipline=discipline,
+                        pdfs, client=client, progress=progress, log=log, scale_label=scale, discipline=discipline,
                         legend_pdf=legend_pdf, legend_image=legend_image,
                     )
                 self._events.put(("done", result))
@@ -396,8 +408,14 @@ if _GUI:
                 if isinstance(result, SystemSizeResult)
                 else self._render_by_system(result)
             )
-            self._results.insert("1.0", text)
-            self._status.configure(text="Done. Save to keep the output.")
+            # The bottom textbox is the activity log; append the final summary
+            # there (there is no separate results pane).
+            self._logbox.insert("end", "\n" + "=" * 56 + "\n" + text + "\n")
+            self._logbox.see("end")
+            flagged = getattr(result, "flagged", None)
+            n_review = len(flagged) if flagged is not None else len(result.review)
+            tail = f" — {n_review} flagged/to review" if n_review else ""
+            self._status.configure(text=f"Done: {result.sheet_count} sheet(s){tail}. Save to keep it.")
 
         def _render_by_system(self, result) -> str:
             lines = [f"=== Takeoff by system: {result.sheet_count} sheet(s) ==="]

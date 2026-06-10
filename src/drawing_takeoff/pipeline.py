@@ -307,6 +307,7 @@ def system_size_for_sheet(
     second_look: bool = True,
     legend_pdf: bytes | None = None,
     legend_image: bytes | None = None,
+    log: Callable[[str], None] | None = None,
 ) -> SystemSizeSheet:
     """One sheet, end to end into a System×Size table.
 
@@ -324,6 +325,7 @@ def system_size_for_sheet(
         render_style_swatch,
     )
 
+    log = log or _noop
     sheet_id = f"{geom.ref.source}#p{geom.ref.page_index}"
     pdf_path, page_index = geom.ref.source, geom.ref.page_index
     ppf = _resolve_ppf(geom, scale_label)
@@ -340,6 +342,7 @@ def system_size_for_sheet(
     # different pens all feed the takeoff, not just the single heaviest-dark pen.
     cands = legend._candidates(geom, ppf=ppf, max_styles=max_styles)
     swatches = {c.style_key: render_style_swatch(c.style_key) for c in cands}
+    log(f"{sheet_id}: scale {ppf:g} pt/ft; labeling {len(cands)} style(s) with Claude… (pipe vs background)")
     style_labels = legend.label_styles(
         geom, client=client, ppf=ppf, discipline=discipline, style_images=swatches,
         legend_pdf=legend_pdf, legend_image=legend_image,
@@ -347,6 +350,7 @@ def system_size_for_sheet(
     )
     pipe = legend.pipe_runs_from_style_labels(runs_by, style_labels)
     if not pipe:
+        log(f"{sheet_id}: no pipe styles identified on this sheet.")
         return SystemSizeSheet(
             sheet=sheet_id, source=pdf_path, page_index=page_index, networks=[],
             tables={"by_system_size": {}, "detail": [], "review": []},
@@ -357,6 +361,7 @@ def system_size_for_sheet(
     all_nets = measure.networks(pipe, ppf=ppf)
     nets = all_nets[:top]
     image = render_networks_png(pdf_path, page_index, nets)
+    log(f"{sheet_id}: {len(nets)} pipe network(s); labeling systems with Claude…")
     # ppf is the override-aware scale (a GUI/CLI manual scale wins over the sheet's
     # own detected one); thread it into the labeling facts so the size callouts the
     # model reads are snapped at the confirmed scale, not the sheet's default.
@@ -366,6 +371,7 @@ def system_size_for_sheet(
     # just those regions (the engine knows where each ambiguity lives).
     flagged = [nw for nw in nets if legend.needs_second_look(labels[nw.id])]
     if flagged and second_look:
+        log(f"{sheet_id}: second look on {len(flagged)} flagged network(s) with Claude…")
         crops = {nw.id: render_network_crop_png(pdf_path, page_index, nw) for nw in flagged}
         labels.update(
             legend.second_look_networks(geom, flagged, labels, crops, client=client, ppf=ppf, discipline=discipline)
@@ -400,6 +406,7 @@ def extract_system_size_takeoff(
     *,
     client=None,
     progress: Callable[[int, int, str], None] | None = None,
+    log: Callable[[str], None] | None = None,
     scale_label: str | None = None,
     discipline: str = "construction",
     max_styles: int = 12,
@@ -423,35 +430,42 @@ def extract_system_size_takeoff(
     """
     from .geometry import extract_pdf_geometry  # deferred: only this needs PyMuPDF
 
+    log = log or _noop
     result = SystemSizeResult()
     sheets: list[SheetGeometry] = []
     for path in pdf_paths:
+        log(f"Reading {Path(path).name}…")
         try:
             sheets.extend(extract_pdf_geometry(str(path)))
         except Exception as exc:  # one unreadable PDF must not sink the run
             result.errors.append(f"{path}: could not read PDF ({exc})")
+            log(f"{Path(path).name}: could not read PDF ({exc})")
 
     total = len(sheets)
     result.sheet_count = total
+    log(f"{total} sheet(s) to process from {len(pdf_paths)} file(s).")
     if client is None and total:
         from .client import get_client  # resolve once, share across sheets
 
         client = get_client()
 
     for i, geom in enumerate(sheets):
+        name = f"{Path(geom.ref.source).name} p{geom.ref.page_index}"
         if progress is not None:
-            progress(i, total, f"{Path(geom.ref.source).name} p{geom.ref.page_index}")
+            progress(i, total, name)
+        log(f"[{i + 1}/{total}] {name}")
         try:
             sheet = system_size_for_sheet(
                 geom, client=client, scale_label=scale_label, discipline=discipline,
                 max_styles=max_styles, top=top, second_look=second_look,
-                legend_pdf=legend_pdf, legend_image=legend_image,
+                legend_pdf=legend_pdf, legend_image=legend_image, log=log,
             )
             _absorb_sheet(result, sheet)
             result.diagnostics.append(f"{sheet.sheet}: {len(sheet.networks)} network(s) labeled")
         except Exception as exc:
             result.errors.append(f"{geom.ref.source}#p{geom.ref.page_index}: {exc}")
             result.diagnostics.append(f"{geom.ref.source}#p{geom.ref.page_index}: ERROR {exc}")
+            log(f"{name}: ERROR {exc}")
 
     if progress is not None:
         progress(total, total, "done")
