@@ -218,3 +218,22 @@ def render_networks_png(
             page.insert_text(fitz.Point(x0, max(y0 + 22, 26)), nw.id, fontsize=34, color=color)
         scale = target_px / max(page.rect.width, page.rect.height)
         return page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False).tobytes("png")
+
+
+def write_marked_up_pdf(pdf_path: str, page_index: int, networks: Sequence[Network], out_path: str) -> None:
+    """Draw the given networks (colored + numbered) onto the sheet and save a new
+    PDF — the marked-up takeoff an estimator opens, prints, and checks the colored
+    runs against. Vector marks on the original page (not a raster), so it stays
+    crisp at any zoom.
+    """
+    with fitz.open(pdf_path) as doc:
+        page = doc[page_index]
+        for i, nw in enumerate(networks):
+            color = _NETWORK_COLORS[i % len(_NETWORK_COLORS)]
+            for run in nw.runs:
+                pts = [fitz.Point(*p) for p in run.polyline]
+                if len(pts) >= 2:
+                    page.draw_polyline(pts, color=color, width=3.0)
+            x0, y0, _, _ = nw.bbox
+            page.insert_text(fitz.Point(x0, max(y0 + 18, 20)), nw.id, fontsize=22, color=color)
+        doc.save(out_path, garbage=3, deflate=True)

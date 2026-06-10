@@ -44,3 +44,33 @@ def test_write_export_creates_timestamped_folder(tmp_path):
         "takeoff_by_system.csv", "takeoff_detail.csv", "diagnostics.txt"
     }
     assert "Sprinkler pipe" in (folder / "takeoff_by_system.csv").read_text()
+
+
+def test_build_takeoff_workbook_has_summary_detail_review():
+    tables = {
+        "by_system_size": {
+            ("Fire-protection sprinkler", '1"'): 100.0,
+            ("Fire-protection sprinkler", '1-1/2"'): 250.0,
+            ("Fire-protection sprinkler", "unsized"): 30.0,
+        },
+        "detail": [
+            {"network": "N0", "system": "Fire-protection sprinkler", "is_pipe": True, "counted": True,
+             "confidence": "high", "ambiguous": False, "linear_feet": 380.0, "pct_page": 40,
+             "sizes": '1"=100, 1-1/2"=250', "reasoning": "main with branches"},
+        ],
+        "review": ["N1: excluded — non-pipe (Matchline) — 200 LF"],
+    }
+    wb = export.build_takeoff_workbook(tables)
+    assert wb.sheetnames == ["Summary", "Detail", "Review"]
+
+    summary = list(wb["Summary"].iter_rows(values_only=True))
+    assert summary[0] == ("System", "Size", "Linear Feet")
+    assert ("Fire-protection sprinkler", '1"', 100.0) in summary
+    # sizes sort ascending; 'unsized' last; a bold total row sums the system
+    assert summary.index(("Fire-protection sprinkler", '1"', 100.0)) < \
+        summary.index(("Fire-protection sprinkler", "unsized", 30.0))
+    assert any(row[0] == "Fire-protection sprinkler — total" and row[2] == 380.0 for row in summary)
+
+    detail = list(wb["Detail"].iter_rows(values_only=True))
+    assert detail[0][0] == "Network" and detail[1][0] == "N0"
+    assert any("N1" in str(row[0]) for row in wb["Review"].iter_rows(values_only=True) if row[0])

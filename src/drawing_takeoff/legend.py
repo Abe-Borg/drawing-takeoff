@@ -433,6 +433,21 @@ def _parse_network_response(response, networks) -> dict[str, SystemLabel]:
 _PAGE_SPAN_ADVISORY = 0.80
 
 
+def _page_spanning_confirms(networks, labels: dict[str, SystemLabel], geometry: SheetGeometry) -> list[str]:
+    """Counted networks that span ~the whole sheet — flagged for a main-vs-matchline
+    glance (a long main and a matchline both span the sheet). Shared by the text
+    report and the workbook so the two review surfaces can't drift."""
+    pw, ph = geometry.page_width_pt, geometry.page_height_pt
+    out = []
+    for nw in networks:
+        lab = labels.get(nw.id)
+        if lab is not None and lab.trusted and pw and ph:
+            x0, y0, x1, y1 = nw.bbox
+            if max((x1 - x0) / pw, (y1 - y0) / ph) >= _PAGE_SPAN_ADVISORY:
+                out.append(f"{nw.id} ({lab.system})")
+    return out
+
+
 def system_size_takeoff(
     networks,
     labels: dict[str, SystemLabel],
@@ -505,19 +520,56 @@ def build_system_size_report(
 
     # Counted networks that span ~the whole sheet are worth a human glance (a long
     # main and a matchline both span the sheet; the model judged this one pipe).
-    pw, ph = geometry.page_width_pt, geometry.page_height_pt
-    spanning = []
-    for nw in networks:
-        lab = labels.get(nw.id)
-        if lab is not None and lab.trusted and pw and ph:
-            x0, y0, x1, y1 = nw.bbox
-            if max((x1 - x0) / pw, (y1 - y0) / ph) >= _PAGE_SPAN_ADVISORY:
-                spanning.append(f"{nw.id} ({lab.system})")
+    spanning = _page_spanning_confirms(networks, labels, geometry)
     if spanning:
         lines += ["", "CONFIRM (counted, but span ~the whole sheet — main vs matchline): " + ", ".join(spanning)]
     if review:
         lines += ["", "REVIEW (not counted):"] + [f"  {r}" for r in review]
     return "\n".join(lines)
+
+
+def takeoff_tables(networks, labels: dict[str, SystemLabel], geometry: SheetGeometry, *,
+                   ppf: float | None = None, radius_ft: float = measure._DEFAULT_SIZE_RADIUS_FT) -> dict:
+    """Assemble what the M8 outputs need from networks + labels, as **plain data**
+    (so the Excel / PDF writers never touch the engine's model types):
+
+      ``by_system_size`` — ``{(system, size_label): LF}`` (trusted pipe only),
+      ``detail``         — one dict per network (id, system, is_pipe, counted, …),
+      ``review``         — the not-counted / confirm notes.
+    """
+    if ppf is None:
+        ppf = geometry.points_per_foot
+    by, review = system_size_takeoff(networks, labels, geometry, ppf=ppf, radius_ft=radius_ft)
+    pw, ph = geometry.page_width_pt, geometry.page_height_pt
+    detail = []
+    for nw in networks:
+        lab = labels.get(nw.id)
+        x0, y0, x1, y1 = nw.bbox
+        pct = round(100.0 * max((x1 - x0) / pw, (y1 - y0) / ph)) if pw and ph else 0
+        by_size = measure.linear_feet_by_size(nw.runs, geometry, ppf=ppf, radius_ft=radius_ft)
+        size_parts = [f"{measure.size_label(s)}={v:.0f}" for s, v in sorted((k, v) for k, v in by_size.items() if k is not None)]
+        if by_size.get(None, 0.0):
+            size_parts.append(f"unsized={by_size[None]:.0f}")  # keep unsized so Sizes reconciles to LF
+        sizes = ", ".join(size_parts)
+        detail.append({
+            "network": nw.id,
+            "system": lab.system if lab is not None else "(unlabeled)",
+            "is_pipe": bool(lab is not None and lab.measurable),
+            "counted": bool(lab is not None and lab.trusted),
+            "confidence": lab.confidence if lab is not None else "low",
+            "ambiguous": bool(lab is not None and lab.ambiguous),
+            "linear_feet": round(nw.length_ft if nw.length_ft is not None else nw.length_pt / ppf, 1),
+            "pct_page": pct,
+            "sizes": sizes,
+            "reasoning": (lab.reasoning if lab is not None else "") or "",
+        })
+    review_notes = list(review)
+    spanning = _page_spanning_confirms(networks, labels, geometry)
+    if spanning:
+        review_notes.append(
+            "CONFIRM (counted, but span ~the whole sheet — main vs matchline): " + ", ".join(spanning)
+        )
+    return {"by_system_size": by, "detail": detail, "review": review_notes}
 
 
 def _load_legend_image(path: str, page: int) -> bytes:
@@ -560,6 +612,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--system-size", action="store_true",
                     help="M7: label the connected networks and print the System x Size takeoff")
     ap.add_argument("--top", type=int, default=8, help="largest N networks to label (with --system-size)")
+    ap.add_argument("--out", default=None, help="with --system-size: also write takeoff.xlsx + a marked-up PDF here")
     args = ap.parse_args(argv)
 
     if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
@@ -585,30 +638,45 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         image = render_networks_png(args.pdf, args.page, nets)
         labels = label_networks(geom, nets, image=image, discipline=args.discipline)
-        report = build_system_size_report(nets, labels, geom, ppf=ppf)
+
+        # Footage outside the labeled set — surfaced, never silently dropped.
+        extra: list[str] = []
         remainder = all_nets[args.top:]
         if remainder:
-            rem_lf = sum((nw.length_ft or 0.0) for nw in remainder)
-            report += (
-                f"\n\nNOT LABELED: {len(remainder)} smaller networks beyond top {args.top} "
-                f"= {rem_lf:,.0f} LF (raise --top to include them; never silently dropped)."
+            extra.append(
+                f"NOT LABELED: {len(remainder)} smaller networks beyond top {args.top} = "
+                f"{sum((nw.length_ft or 0.0) for nw in remainder):,.0f} LF (raise --top to include them)."
             )
-        # The candidate set is the single heaviest-dark pen, so pipe drawn with a
-        # second (thinner) dark pen would otherwise vanish. Surface other dark
-        # lineweights rather than drop them silently — much is text/symbols, but a
-        # human (or, later, the LLM picking the real pipe styles) confirms.
         other_n = other_lf = 0
         for k, rs in runs_by.items():
             if rs and k != pipe_style and k.stroke_color is not None and max(k.stroke_color) < 0.30 and (k.width or 0) > 0:
                 other_n += 1
                 other_lf += sum(r.length_pt for r in rs) / ppf
         if other_n:
-            report += (
-                f"\n\nOTHER DARK LINEWEIGHTS not in this takeoff: {other_n} style(s) = {other_lf:,.0f} LF. "
-                "The candidate set is the single heaviest-dark pen; much of this is text/symbols, but "
-                "confirm none is pipe (multi-style pipe selection is future M7 work)."
+            extra.append(
+                f"OTHER DARK LINEWEIGHTS not in this takeoff: {other_n} style(s) = {other_lf:,.0f} LF "
+                "(candidate is the heaviest-dark pen; confirm none is pipe — multi-style selection is future work)."
             )
+
+        report = build_system_size_report(nets, labels, geom, ppf=ppf)
+        if extra:
+            report += "\n\n" + "\n".join(extra)
         print(report)
+
+        if args.out:
+            import datetime as _dt
+            from pathlib import Path as _Path
+
+            from . import export
+            from .geometry import write_marked_up_pdf
+
+            tables = takeoff_tables(nets, labels, geom, ppf=ppf)
+            tables["review"] = tables["review"] + extra
+            folder = _Path(args.out) / f"takeoff_{_dt.datetime.now():%Y%m%d_%H%M%S}"
+            folder.mkdir(parents=True, exist_ok=True)
+            export.build_takeoff_workbook(tables).save(folder / "takeoff.xlsx")
+            write_marked_up_pdf(args.pdf, args.page, nets, str(folder / "takeoff_markup.pdf"))
+            print(f"\nWrote {folder}/  (takeoff.xlsx, takeoff_markup.pdf)")
         return 0
 
     ppf = geom.points_per_foot
