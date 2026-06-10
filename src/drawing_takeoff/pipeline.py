@@ -21,9 +21,21 @@ from typing import Callable, Sequence
 
 from . import legend, measure
 from . import scale as _scale
-from .models import SheetGeometry, TakeoffItem, TakeoffResult
+from .core import api_config
+from .models import (
+    SheetGeometry,
+    SystemSizeResult,
+    SystemSizeSheet,
+    TakeoffItem,
+    TakeoffResult,
+)
 
-__all__ = ["extract_takeoff"]
+__all__ = [
+    "extract_takeoff",
+    "extract_system_size_takeoff",
+    "system_size_for_sheet",
+    "write_system_size_export",
+]
 
 # Upper bound on styles sent for labeling per sheet. High enough that all real
 # measured styles on a normal sheet are labeled (so footage is never dropped by
@@ -195,3 +207,244 @@ def extract_takeoff(
         progress(total, total, "done")
     result.per_system_totals = _aggregate(result.items)
     return result
+
+
+# ---------------------------------------------------------------------------
+# System × Size takeoff (M5–M8): pipe networks -> system -> size, aggregated
+# across a set. The richer deliverable the legend CLI's --system-size exposes;
+# lifted here so the GUI and the CLI run one orchestration (and it stays
+# unit-testable with a fake client, like extract_takeoff above).
+# ---------------------------------------------------------------------------
+def _style_review_notes(
+    runs_by, style_labels, all_nets, *, top: int, max_styles: int, ppf: float
+) -> list[str]:
+    """Surface what the System×Size pass did NOT count, so footage is never
+    silently dropped: networks beyond the top-N cap, styles the model called
+    maybe-pipe (flagged, not counted), confident non-pipe exclusions, and styles
+    ranked below the style cap (never shown to the model)."""
+    extra: list[str] = []
+    remainder = all_nets[top:]
+    if remainder:
+        extra.append(
+            f"NOT LABELED: {len(remainder)} smaller networks beyond the top {top} = "
+            f"{sum((nw.length_ft or 0.0) for nw in remainder):,.0f} LF "
+            "(raise the network cap to include them)."
+        )
+    excluded_n = excluded_lf = unreviewed_n = unreviewed_lf = 0
+    for style, rs in runs_by.items():
+        if not rs:
+            continue
+        lab = style_labels.get(style)
+        lf = sum(r.length_pt for r in rs) / ppf
+        if lab is None:  # ranked below the style cap -> never judged; surface, don't hide
+            unreviewed_n += 1
+            unreviewed_lf += lf
+        elif lab.trusted:
+            continue  # confidently pipe -> counted
+        elif lab.measurable:  # maybe pipe -> surfaced for confirmation, NOT auto-counted
+            extra.append(
+                f"STYLE TO CONFIRM (maybe pipe — NOT counted): {lab.system} "
+                f"({lf:,.0f} LF) — {lab.reasoning or 'unsure if pipe'}"
+            )
+        else:
+            excluded_n += 1
+            excluded_lf += lf
+    if excluded_n:
+        extra.append(f"EXCLUDED as non-pipe by the style pass: {excluded_n} style(s) = {excluded_lf:,.0f} LF.")
+    if unreviewed_n:
+        extra.append(
+            f"NOT REVIEWED (ranked below the style cap of {max_styles}): "
+            f"{unreviewed_n} style(s) = {unreviewed_lf:,.0f} LF — raise the style cap to classify them."
+        )
+    return extra
+
+
+def system_size_for_sheet(
+    geom: SheetGeometry,
+    *,
+    client=None,
+    scale_label: str | None = None,
+    discipline: str = "construction",
+    max_styles: int = 12,
+    top: int = 8,
+    second_look: bool = True,
+    legend_pdf: bytes | None = None,
+    legend_image: bytes | None = None,
+) -> SystemSizeSheet:
+    """One sheet, end to end into a System×Size table.
+
+    style→pipe (M3) → connected networks (M5) → size callouts (M6) →
+    network→system labels with a high-DPI second-look re-check (M7). Returns plain
+    data plus the labeled networks (so a marked-up PDF can be re-rendered), so the
+    GUI and the ``legend --system-size`` CLI share one orchestration. The LLM only
+    ever labels — every linear foot traces back to exact geometry. Rendering reads
+    the sheet from ``geom.ref.source``/``page_index``. Raises ``ValueError`` when
+    the sheet carries no usable scale (the caller records it as a per-sheet error).
+    """
+    from .geometry import (  # deferred: the only PyMuPDF touch (renders the marks)
+        render_network_crop_png,
+        render_networks_png,
+        render_style_swatch,
+    )
+
+    sheet_id = f"{geom.ref.source}#p{geom.ref.page_index}"
+    pdf_path, page_index = geom.ref.source, geom.ref.page_index
+    ppf = _resolve_ppf(geom, scale_label)
+    if not ppf:
+        raise ValueError(f"{sheet_id}: no scale detected (confirm the scale and re-run)")
+    if client is None:
+        from .client import get_client
+
+        client = get_client()
+
+    runs_by = measure.runs_by_style(geom, ppf=ppf, exclude_border=True)
+
+    # Pass 1 (M3): which styles are pipe — so mains and branches drawn in
+    # different pens all feed the takeoff, not just the single heaviest-dark pen.
+    cands = legend._candidates(geom, ppf=ppf, max_styles=max_styles)
+    swatches = {c.style_key: render_style_swatch(c.style_key) for c in cands}
+    style_labels = legend.label_styles(
+        geom, client=client, ppf=ppf, discipline=discipline, style_images=swatches,
+        legend_pdf=legend_pdf, legend_image=legend_image,
+        max_styles=max_styles, model=api_config.MODEL_SONNET_46,
+    )
+    pipe = legend.pipe_runs_from_style_labels(runs_by, style_labels)
+    if not pipe:
+        return SystemSizeSheet(
+            sheet=sheet_id, source=pdf_path, page_index=page_index, networks=[],
+            tables={"by_system_size": {}, "detail": [], "review": []},
+            report=f"=== System×Size: {sheet_id} ===\n  no pipe styles identified on this sheet.",
+        )
+
+    # Pass 2 (M5 + M7): connect the pipe runs into networks and name each system.
+    all_nets = measure.networks(pipe, ppf=ppf)
+    nets = all_nets[:top]
+    image = render_networks_png(pdf_path, page_index, nets)
+    labels = legend.label_networks(geom, nets, client=client, image=image, discipline=discipline)
+
+    # Second look: re-check only the flagged networks, from high-DPI close-ups of
+    # just those regions (the engine knows where each ambiguity lives).
+    flagged = [nw for nw in nets if legend.needs_second_look(labels[nw.id])]
+    if flagged and second_look:
+        crops = {nw.id: render_network_crop_png(pdf_path, page_index, nw) for nw in flagged}
+        labels.update(
+            legend.second_look_networks(geom, flagged, labels, crops, client=client, discipline=discipline)
+        )
+
+    notes = _style_review_notes(runs_by, style_labels, all_nets, top=top, max_styles=max_styles, ppf=ppf)
+    report = legend.build_system_size_report(nets, labels, geom, ppf=ppf)
+    if notes:
+        report += "\n\n" + "\n".join(notes)
+    tables = legend.takeoff_tables(nets, labels, geom, ppf=ppf)
+    tables["review"] = list(tables["review"]) + notes
+    return SystemSizeSheet(
+        sheet=sheet_id, source=pdf_path, page_index=page_index, networks=nets,
+        tables=tables, report=report, notes=notes,
+    )
+
+
+def _absorb_sheet(result: SystemSizeResult, sheet: SystemSizeSheet) -> None:
+    """Fold one sheet into the set-wide totals: sum the System×Size table, tag each
+    detail row with its sheet, and prefix review notes with the sheet id."""
+    result.sheets.append(sheet)
+    for key, lf in sheet.tables.get("by_system_size", {}).items():
+        result.by_system_size[key] = result.by_system_size.get(key, 0.0) + lf
+    for row in sheet.tables.get("detail", []):
+        result.detail.append({"sheet": sheet.sheet, **row})
+    for note in sheet.tables.get("review", []):
+        result.review.append(f"{sheet.sheet}: {note}")
+
+
+def extract_system_size_takeoff(
+    pdf_paths: Sequence[str | Path],
+    *,
+    client=None,
+    progress: Callable[[int, int, str], None] | None = None,
+    scale_label: str | None = None,
+    discipline: str = "construction",
+    max_styles: int = 12,
+    top: int = 8,
+    second_look: bool = True,
+    legend_pdf: bytes | None = None,
+    legend_image: bytes | None = None,
+) -> SystemSizeResult:
+    """Run a System×Size takeoff over ``pdf_paths`` and aggregate across the set.
+
+    Each sheet is taken end to end by :func:`system_size_for_sheet` (style→pipe →
+    networks → size → system, with a second-look re-check); the per-sheet
+    System×Size tables are summed into one set-wide total, and every sheet's
+    labeled networks are retained so :func:`write_system_size_export` can emit a
+    marked-up PDF per sheet. One unreadable sheet is recorded in ``errors`` and
+    skipped — it never sinks the run.
+
+    Args mirror :func:`extract_takeoff`, plus the System×Size knobs: ``top``
+    (largest N networks labeled per sheet), ``max_styles`` (styles classified per
+    sheet), and ``second_look`` (the high-DPI re-check of flagged networks).
+    """
+    from .geometry import extract_pdf_geometry  # deferred: only this needs PyMuPDF
+
+    result = SystemSizeResult()
+    sheets: list[SheetGeometry] = []
+    for path in pdf_paths:
+        try:
+            sheets.extend(extract_pdf_geometry(str(path)))
+        except Exception as exc:  # one unreadable PDF must not sink the run
+            result.errors.append(f"{path}: could not read PDF ({exc})")
+
+    total = len(sheets)
+    result.sheet_count = total
+    if client is None and total:
+        from .client import get_client  # resolve once, share across sheets
+
+        client = get_client()
+
+    for i, geom in enumerate(sheets):
+        if progress is not None:
+            progress(i, total, f"{Path(geom.ref.source).name} p{geom.ref.page_index}")
+        try:
+            sheet = system_size_for_sheet(
+                geom, client=client, scale_label=scale_label, discipline=discipline,
+                max_styles=max_styles, top=top, second_look=second_look,
+                legend_pdf=legend_pdf, legend_image=legend_image,
+            )
+            _absorb_sheet(result, sheet)
+            result.diagnostics.append(f"{sheet.sheet}: {len(sheet.networks)} network(s) labeled")
+        except Exception as exc:
+            result.errors.append(f"{geom.ref.source}#p{geom.ref.page_index}: {exc}")
+            result.diagnostics.append(f"{geom.ref.source}#p{geom.ref.page_index}: ERROR {exc}")
+
+    if progress is not None:
+        progress(total, total, "done")
+    return result
+
+
+def write_system_size_export(
+    result: SystemSizeResult, out_dir: str | Path = ".", *, project_name: str = "takeoff"
+) -> Path:
+    """Write the System×Size deliverables into a ``<slug>_<timestamp>`` folder.
+
+    One Excel workbook (``takeoff.xlsx`` — Summary / Detail / Review, aggregated
+    across the set) plus one marked-up PDF per sheet (``<stem>_p<page>_markup.pdf``,
+    colored + numbered networks on the original page). Returns the folder.
+    """
+    from datetime import datetime
+
+    from . import export
+    from .geometry import write_marked_up_pdf  # deferred: PyMuPDF for the markup
+
+    folder = Path(out_dir) / f"{export._slug(project_name)}_{datetime.now():%Y%m%d_%H%M%S}"
+    folder.mkdir(parents=True, exist_ok=True)
+    export.build_takeoff_workbook(result.as_tables()).save(folder / "takeoff.xlsx")
+
+    used: set[str] = set()
+    for sheet in result.sheets:
+        if not sheet.networks:  # nothing to mark up on a sheet with no pipe
+            continue
+        name = f"{Path(sheet.source).stem}_p{sheet.page_index}_markup.pdf"
+        n = 2
+        while name in used:  # two inputs can share a stem+page across folders
+            name = f"{Path(sheet.source).stem}_p{sheet.page_index}_{n}_markup.pdf"
+            n += 1
+        used.add(name)
+        write_marked_up_pdf(sheet.source, sheet.page_index, sheet.networks, str(folder / name))
+    return folder

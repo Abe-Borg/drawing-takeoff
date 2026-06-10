@@ -858,98 +858,27 @@ def main(argv: list[str] | None = None) -> int:
     geom = extract_pdf_geometry(args.pdf, pages=[args.page])[0]
 
     if args.system_size:
-        from .geometry import render_networks_png, render_style_swatch
+        # The System×Size path (style→pipe → networks → size → system, second-look
+        # re-check, Excel + marked-up PDF) lives in the pipeline so the GUI and this
+        # CLI run one orchestration. Deferred import avoids a legend<->pipeline cycle.
+        from . import pipeline
 
-        ppf = geom.points_per_foot
-        runs_by = measure.runs_by_style(geom, ppf=ppf, exclude_border=True)
-
-        # Pass 1: the LLM picks which styles are pipe (vs text / symbols / background),
-        # so mains and branches in different pens all feed the takeoff — not just the
-        # single heaviest-dark pen.
-        cands = _candidates(geom, ppf=ppf, max_styles=args.max_styles)
-        swatches = {c.style_key: render_style_swatch(c.style_key) for c in cands}
-        style_labels = label_styles(geom, ppf=ppf, discipline=args.discipline,
-                                    style_images=swatches, max_styles=args.max_styles,
-                                    model=api_config.MODEL_SONNET_46)
-        pipe = pipe_runs_from_style_labels(runs_by, style_labels)
-        if not pipe:
-            print("No pipe styles identified on this sheet.")
-            return 0
-
-        # Pass 2: connect the pipe runs into systems and name them.
-        all_nets = measure.networks(pipe, ppf=ppf)
-        nets = all_nets[: args.top]
-        image = render_networks_png(args.pdf, args.page, nets)
-        labels = label_networks(geom, nets, image=image, discipline=args.discipline)
-
-        # Second look: re-check what the first pass flagged, from high-DPI
-        # close-ups of just those networks (the engine knows where each
-        # ambiguity lives, so only that region is rendered large).
-        flagged = [nw for nw in nets if needs_second_look(labels[nw.id])]
-        if flagged and not args.no_second_look:
-            from .geometry import render_network_crop_png
-
-            crops = {nw.id: render_network_crop_png(args.pdf, args.page, nw) for nw in flagged}
-            labels.update(second_look_networks(geom, flagged, labels, crops, discipline=args.discipline))
-
-        extra: list[str] = []
-        remainder = all_nets[args.top:]
-        if remainder:
-            extra.append(
-                f"NOT LABELED: {len(remainder)} smaller networks beyond top {args.top} = "
-                f"{sum((nw.length_ft or 0.0) for nw in remainder):,.0f} LF (raise --top to include them)."
-            )
-        # Styles the LLM classified as NON-pipe (text/symbols/background) — surfaced,
-        # not silently dropped; styles it was unsure about are flagged to confirm.
-        excluded_n = excluded_lf = unreviewed_n = unreviewed_lf = 0
-        for style, rs in runs_by.items():
-            if not rs:
-                continue
-            lab = style_labels.get(style)
-            lf = sum(r.length_pt for r in rs) / ppf
-            if lab is None:
-                # ranked below the --max-styles cap, so never shown to the LLM:
-                # NOT judged non-pipe. Surface separately so a pipe style down here
-                # isn't hidden inside the non-pipe total.
-                unreviewed_n += 1
-                unreviewed_lf += lf
-            elif lab.trusted:
-                continue  # confidently pipe -> counted
-            elif lab.measurable:
-                # measurable but not trusted: maybe pipe, surfaced for confirmation,
-                # NOT auto-counted (so an unsure call can't inflate the total).
-                extra.append(f"STYLE TO CONFIRM (maybe pipe — NOT counted): {lab.system} "
-                             f"({lf:,.0f} LF) — {lab.reasoning or 'unsure if pipe'}")
-            else:
-                excluded_n += 1
-                excluded_lf += lf
-        if excluded_n:
-            extra.append(f"EXCLUDED as non-pipe by the style pass: {excluded_n} style(s) = {excluded_lf:,.0f} LF.")
-        if unreviewed_n:
-            extra.append(
-                f"NOT REVIEWED (ranked below the --max-styles cap of {args.max_styles}): "
-                f"{unreviewed_n} style(s) = {unreviewed_lf:,.0f} LF — raise --max-styles to classify them."
-            )
-
-        report = build_system_size_report(nets, labels, geom, ppf=ppf)
-        if extra:
-            report += "\n\n" + "\n".join(extra)
-        print(report)
+        legend_kind, legend_bytes = (
+            _load_legend_attachment(args.legend, args.legend_page) if args.legend else (None, None)
+        )
+        sheet = pipeline.system_size_for_sheet(
+            geom, discipline=args.discipline, max_styles=args.max_styles, top=args.top,
+            second_look=not args.no_second_look,
+            legend_pdf=legend_bytes if legend_kind == "pdf" else None,
+            legend_image=legend_bytes if legend_kind == "image" else None,
+        )
+        print(sheet.report)
 
         if args.out:
-            import datetime as _dt
-            from pathlib import Path as _Path
-
-            from . import export
-            from .geometry import write_marked_up_pdf
-
-            tables = takeoff_tables(nets, labels, geom, ppf=ppf)
-            tables["review"] = tables["review"] + extra
-            folder = _Path(args.out) / f"takeoff_{_dt.datetime.now():%Y%m%d_%H%M%S}"
-            folder.mkdir(parents=True, exist_ok=True)
-            export.build_takeoff_workbook(tables).save(folder / "takeoff.xlsx")
-            write_marked_up_pdf(args.pdf, args.page, nets, str(folder / "takeoff_markup.pdf"))
-            print(f"\nWrote {folder}/  (takeoff.xlsx, takeoff_markup.pdf)")
+            result = pipeline.SystemSizeResult(sheet_count=1)
+            pipeline._absorb_sheet(result, sheet)
+            folder = pipeline.write_system_size_export(result, args.out, project_name="takeoff")
+            print(f"\nWrote {folder}/  (takeoff.xlsx + one marked-up PDF)")
         return 0
 
     ppf = geom.points_per_foot
