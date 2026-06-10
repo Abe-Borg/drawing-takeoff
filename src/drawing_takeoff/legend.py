@@ -482,6 +482,7 @@ def label_networks(
     *,
     client=None,
     image: bytes | None = None,
+    ppf: float | None = None,
     discipline: str = "construction",
     model: str | None = None,
 ) -> dict[str, SystemLabel]:
@@ -511,7 +512,7 @@ def label_networks(
 
         client = get_client()
 
-    content: list[dict] = [{"type": "text", "text": network_facts(geometry, networks, discipline=discipline)}]
+    content: list[dict] = [{"type": "text", "text": network_facts(geometry, networks, ppf=ppf, discipline=discipline)}]
     if image:
         content.append({"type": "text", "text": "The sheet, with each network drawn in its color and labeled with its id:"})
         content.append(_image_block(image))
@@ -587,6 +588,7 @@ def second_look_networks(
     crops: dict[str, bytes],
     *,
     client=None,
+    ppf: float | None = None,
     discipline: str = "construction",
     model: str | None = None,
 ) -> dict[str, SystemLabel]:
@@ -614,7 +616,7 @@ def second_look_networks(
 
         client = get_client()
 
-    content: list[dict] = [{"type": "text", "text": network_facts(geometry, networks, discipline=discipline)}]
+    content: list[dict] = [{"type": "text", "text": network_facts(geometry, networks, ppf=ppf, discipline=discipline)}]
     notes = []
     for nw in networks:
         lab = first_pass.get(nw.id)

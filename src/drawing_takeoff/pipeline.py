@@ -320,7 +320,10 @@ def system_size_for_sheet(
     all_nets = measure.networks(pipe, ppf=ppf)
     nets = all_nets[:top]
     image = render_networks_png(pdf_path, page_index, nets)
-    labels = legend.label_networks(geom, nets, client=client, image=image, discipline=discipline)
+    # ppf is the override-aware scale (a GUI/CLI manual scale wins over the sheet's
+    # own detected one); thread it into the labeling facts so the size callouts the
+    # model reads are snapped at the confirmed scale, not the sheet's default.
+    labels = legend.label_networks(geom, nets, client=client, image=image, ppf=ppf, discipline=discipline)
 
     # Second look: re-check only the flagged networks, from high-DPI close-ups of
     # just those regions (the engine knows where each ambiguity lives).
@@ -328,7 +331,7 @@ def system_size_for_sheet(
     if flagged and second_look:
         crops = {nw.id: render_network_crop_png(pdf_path, page_index, nw) for nw in flagged}
         labels.update(
-            legend.second_look_networks(geom, flagged, labels, crops, client=client, discipline=discipline)
+            legend.second_look_networks(geom, flagged, labels, crops, client=client, ppf=ppf, discipline=discipline)
         )
 
     notes = _style_review_notes(runs_by, style_labels, all_nets, top=top, max_styles=max_styles, ppf=ppf)
