@@ -12,14 +12,19 @@ legend image, and asked to reconcile them; it flags styles it can't place rather
 than guessing. Every :class:`SystemLabel` carries a ``confidence`` and an
 ``ambiguous`` flag so the engine totals only what it can stand behind.
 
-Structured output is obtained via a forced single tool call
-(``record_system_labels``); the response is parsed from the ``tool_use`` block.
-No PyMuPDF here — images arrive as PNG bytes (rendered by ``geometry``), and the
+Structured output is obtained via the API's enforced JSON-schema response
+format (``output_config.format``), parsed from the reply's text block. A forced
+tool call would also guarantee the schema, but forced ``tool_choice`` is
+incompatible with thinking — and adaptive thinking (with the central effort
+policy, ``api_config.PHASE_LABELING``) is what these vision+reasoning
+judgments benefit from most. No PyMuPDF here — images arrive as PNG bytes and
+legend pages as single-page PDF bytes (both produced by ``geometry``), and the
 Anthropic client is duck-typed and injectable for hermetic tests.
 """
 from __future__ import annotations
 
 import base64
+import json
 import logging
 from dataclasses import dataclass
 
@@ -28,8 +33,6 @@ from .core import api_config
 from .models import SheetGeometry, StyleKey, SystemLabel
 
 _log = logging.getLogger(__name__)
-
-_MAX_TOKENS = 4096  # the structured reply is small; well under the streaming threshold
 
 _SYSTEM_PROMPT = """\
 You are a quantity-takeoff assistant for construction drawings. You are given \
@@ -53,46 +56,41 @@ even if a legend omits it. When you cannot confidently place a style, set \
 `ambiguous` true and `confidence` low rather than guessing — a human reviews \
 flagged styles.
 
-Call the `record_system_labels` tool exactly once, with one entry for every \
-style id provided."""
+Reply with the labels JSON (the response format is enforced): a `labels` array \
+with exactly one entry for every style id provided."""
 
-_TOOL = {
-    "name": "record_system_labels",
-    "description": "Record the building system and measurability of each line style on the sheet.",
-    "strict": True,
-    "input_schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "labels": {
-                "type": "array",
-                "description": "One entry per style id given in the prompt.",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "style_id": {"type": "string"},
-                        "system": {
-                            "type": "string",
-                            "description": "System name; use 'Background / non-takeoff' for reference linework.",
-                        },
-                        "measurable": {
-                            "type": "boolean",
-                            "description": "True only for a linear run to be totaled (pipe/duct/conduit/wall).",
-                        },
-                        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
-                        "ambiguous": {
-                            "type": "boolean",
-                            "description": "True if you could not confidently place it; flagged for human review.",
-                        },
-                        "reasoning": {"type": "string"},
+_LABELS_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "labels": {
+            "type": "array",
+            "description": "One entry per style id given in the prompt.",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "style_id": {"type": "string"},
+                    "system": {
+                        "type": "string",
+                        "description": "System name; use 'Background / non-takeoff' for reference linework.",
                     },
-                    "required": ["style_id", "system", "measurable", "confidence", "ambiguous", "reasoning"],
+                    "measurable": {
+                        "type": "boolean",
+                        "description": "True only for a linear run to be totaled (pipe/duct/conduit/wall).",
+                    },
+                    "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                    "ambiguous": {
+                        "type": "boolean",
+                        "description": "True if you could not confidently place it; flagged for human review.",
+                    },
+                    "reasoning": {"type": "string"},
                 },
-            }
-        },
-        "required": ["labels"],
+                "required": ["style_id", "system", "measurable", "confidence", "ambiguous", "reasoning"],
+            },
+        }
     },
+    "required": ["labels"],
 }
 
 
@@ -167,6 +165,57 @@ def _image_block(png_bytes: bytes) -> dict:
     }
 
 
+def _document_block(pdf_bytes: bytes) -> dict:
+    """Native-PDF content block: the model gets the page image AND its text layer."""
+    return {
+        "type": "document",
+        "source": {
+            "type": "base64",
+            "media_type": "application/pdf",
+            "data": base64.standard_b64encode(pdf_bytes).decode("ascii"),
+        },
+    }
+
+
+def _request_kwargs(*, model: str, system: str, content: list[dict], schema: dict) -> dict:
+    """Assemble the structured-output labeling request (shared by M3 and M7).
+
+    The JSON-schema response format rides ``output_config`` next to the
+    central effort policy, and adaptive thinking is attached per
+    ``api_config.PHASE_LABELING`` — the schema stays enforced without a forced
+    tool call, which thinking does not allow.
+    """
+    kwargs: dict = {
+        "model": model,
+        "max_tokens": api_config.phase_output_cap(api_config.PHASE_LABELING, model=model),
+        "system": system,
+        "messages": [{"role": "user", "content": content}],
+    }
+    output_config = api_config.effort_config_for(model=model, phase=api_config.PHASE_LABELING) or {}
+    output_config["format"] = {"type": "json_schema", "schema": schema}
+    kwargs["output_config"] = output_config
+    return api_config.apply_thinking_config(kwargs, model=model, phase=api_config.PHASE_LABELING)
+
+
+def _labels_from_response(response) -> list[dict]:
+    """The ``labels`` array from a structured-output reply.
+
+    Scans text blocks (thinking blocks may precede the JSON) and returns the
+    first parseable ``{"labels": [...]}``. Malformed output yields ``[]`` so
+    every id falls back to the flagged default — never a crash, never a guess.
+    """
+    for block in getattr(response, "content", []) or []:
+        if getattr(block, "type", None) != "text":
+            continue
+        try:
+            data = json.loads(getattr(block, "text", "") or "")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(data, dict) and isinstance(data.get("labels"), list):
+            return [item for item in data["labels"] if isinstance(item, dict)]
+    return []
+
+
 def label_styles(
     geometry: SheetGeometry,
     *,
@@ -175,6 +224,7 @@ def label_styles(
     discipline: str = "construction",
     style_images: dict[StyleKey, bytes] | None = None,
     legend_image: bytes | None = None,
+    legend_pdf: bytes | None = None,
     max_styles: int = 12,
     model: str | None = None,
 ) -> dict[StyleKey, SystemLabel]:
@@ -182,10 +232,13 @@ def label_styles(
 
     ``client`` is a duck-typed Anthropic client (``client.messages.create``);
     when ``None`` the vendored :func:`drawing_takeoff.client.get_client` is used.
-    ``style_images`` / ``legend_image`` are optional PNG bytes (rendered by
+    ``style_images`` are optional PNG bytes (rendered by
     :mod:`drawing_takeoff.geometry`); the call also works on the text stats
-    alone. Styles the model omits default to an ambiguous, low-confidence label
-    so nothing is silently trusted.
+    alone. The advisory legend attaches as ``legend_pdf`` (single-page PDF
+    bytes, preferred — a native ``document`` block carries the page's real
+    text layer) or ``legend_image`` (PNG bytes, for raster legends); when both
+    are given the PDF wins. Styles the model omits default to an ambiguous,
+    low-confidence label so nothing is silently trusted.
     """
     if ppf is None:
         ppf = geometry.points_per_foot
@@ -216,7 +269,7 @@ def label_styles(
             if img:
                 content.append({"type": "text", "text": f"Swatch for {c.style_id}:"})
                 content.append(_image_block(img))
-    if legend_image:
+    if legend_pdf or legend_image:
         content.append(
             {
                 "type": "text",
@@ -224,18 +277,13 @@ def label_styles(
                 "(advisory — reconcile against the drawing, do not trust blindly):",
             }
         )
-        content.append(_image_block(legend_image))
+        content.append(_document_block(legend_pdf) if legend_pdf else _image_block(legend_image))
     content.append(
-        {"type": "text", "text": "Call record_system_labels once with an entry for every style id above."}
+        {"type": "text", "text": "Return the labels JSON, with one entry for every style id above."}
     )
 
     response = client.messages.create(
-        model=model,
-        max_tokens=_MAX_TOKENS,
-        system=_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": content}],
-        tools=[_TOOL],
-        tool_choice={"type": "tool", "name": "record_system_labels"},
+        **_request_kwargs(model=model, system=_SYSTEM_PROMPT, content=content, schema=_LABELS_SCHEMA)
     )
 
     return _parse_response(response, id_to_style)
@@ -243,20 +291,17 @@ def label_styles(
 
 def _parse_response(response, id_to_style: dict[str, StyleKey]) -> dict[StyleKey, SystemLabel]:
     out: dict[StyleKey, SystemLabel] = {}
-    for block in getattr(response, "content", []) or []:
-        if getattr(block, "type", None) != "tool_use" or getattr(block, "name", None) != "record_system_labels":
+    for item in _labels_from_response(response):
+        style = id_to_style.get(item.get("style_id"))
+        if style is None:
             continue
-        for item in (getattr(block, "input", {}) or {}).get("labels", []):
-            style = id_to_style.get(item.get("style_id"))
-            if style is None:
-                continue
-            out[style] = SystemLabel(
-                system=str(item.get("system", "")).strip() or "(unnamed)",
-                measurable=bool(item.get("measurable", False)),
-                confidence=str(item.get("confidence", "low")).lower(),
-                ambiguous=bool(item.get("ambiguous", False)),
-                reasoning=item.get("reasoning"),
-            )
+        out[style] = SystemLabel(
+            system=str(item.get("system", "")).strip() or "(unnamed)",
+            measurable=bool(item.get("measurable", False)),
+            confidence=str(item.get("confidence", "low")).lower(),
+            ambiguous=bool(item.get("ambiguous", False)),
+            reasoning=item.get("reasoning"),
+        )
     # Anything the model didn't address is flagged, never silently trusted.
     for style in id_to_style.values():
         out.setdefault(
@@ -289,43 +334,47 @@ confidently place it — for example a long sheet-spanning network you are unsur
 A human reviews every ambiguous or low-confidence network, so flag rather than guess.
   - `reasoning`: one sentence citing what you saw.
 
-Call `record_network_labels` exactly once, with one entry for every network id given."""
+Reply with the labels JSON (the response format is enforced): a `labels` array \
+with exactly one entry for every network id given."""
 
-_NETWORK_TOOL = {
-    "name": "record_network_labels",
-    "description": "Record the building system and measurability of each numbered network on the sheet.",
-    "strict": True,
-    "input_schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "labels": {
-                "type": "array",
-                "description": "One entry per network id given in the prompt.",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "network_id": {"type": "string"},
-                        "system": {
-                            "type": "string",
-                            "description": "System name; 'Matchline / non-pipe' for non-pipe linework.",
-                        },
-                        "is_pipe": {"type": "boolean", "description": "True only for real pipe to be totaled."},
-                        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
-                        "ambiguous": {
-                            "type": "boolean",
-                            "description": "True if you could not confidently place it; flagged for review.",
-                        },
-                        "reasoning": {"type": "string"},
+_NETWORK_LABELS_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "labels": {
+            "type": "array",
+            "description": "One entry per network id given in the prompt.",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "network_id": {"type": "string"},
+                    "system": {
+                        "type": "string",
+                        "description": "System name; 'Matchline / non-pipe' for non-pipe linework.",
                     },
-                    "required": ["network_id", "system", "is_pipe", "confidence", "ambiguous", "reasoning"],
+                    "is_pipe": {"type": "boolean", "description": "True only for real pipe to be totaled."},
+                    "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                    "ambiguous": {
+                        "type": "boolean",
+                        "description": "True if you could not confidently place it; flagged for review.",
+                    },
+                    "reasoning": {"type": "string"},
                 },
-            }
-        },
-        "required": ["labels"],
+                "required": ["network_id", "system", "is_pipe", "confidence", "ambiguous", "reasoning"],
+            },
+        }
     },
+    "required": ["labels"],
 }
+
+# Above this many numbered networks on one sheet, labeling routes to the Opus
+# tier: the set-of-marks render targets 2400px on the long edge, which Opus
+# 4.7+ accepts at full resolution while Sonnet 4.6 downscales to 1568px — and
+# crowded marks are exactly where that resolution decides legibility. The M7
+# probe validated Sonnet on sheets labeled at the default --top 8, so the
+# default path stays on the cheaper model.
+_DENSE_NETWORK_THRESHOLD = 12
 
 
 def network_facts(geometry: SheetGeometry, networks, *, ppf: float | None = None, discipline: str = "construction") -> str:
@@ -367,21 +416,27 @@ def label_networks(
     discipline: str = "construction",
     model: str | None = None,
 ) -> dict[str, SystemLabel]:
-    """Map each network id to a :class:`SystemLabel` via one forced tool call.
+    """Map each network id to a :class:`SystemLabel` via one structured call.
 
     Generalizes :func:`label_styles` to M5 networks: the model gets the numbered
     set-of-marks ``image`` plus the per-network facts and returns, per id, the
     system and whether it's real pipe (``measurable``) — keyed on the engine's
     network ids, so its labels bind back to exact geometry. It supplies no
-    numbers. Defaults to Sonnet 4.6, which the M7 probe validated for this
-    vision+reasoning task at a fraction of Opus's cost; pass ``model`` to change.
-    Networks the model omits default to an ambiguous, non-measurable label.
+    numbers. Defaults to Sonnet 4.6 (M7-probe-validated at a fraction of Opus's
+    cost); past :data:`_DENSE_NETWORK_THRESHOLD` networks it routes to the Opus
+    tier, whose larger image cap keeps the crowded 2400px overlay legible. Pass
+    ``model`` to override either way. Networks the model omits default to an
+    ambiguous, non-measurable label.
     """
     networks = list(networks)
     if not networks:
         return {}
     if model is None:
-        model = api_config.MODEL_SONNET_46
+        model = (
+            api_config.LABELING_DENSE_MODEL_DEFAULT
+            if len(networks) > _DENSE_NETWORK_THRESHOLD
+            else api_config.LABELING_MODEL_DEFAULT
+        )
     if client is None:
         from .client import get_client
 
@@ -391,15 +446,12 @@ def label_networks(
     if image:
         content.append({"type": "text", "text": "The sheet, with each network drawn in its color and labeled with its id:"})
         content.append(_image_block(image))
-    content.append({"type": "text", "text": "Call record_network_labels once, with one entry for every network id above."})
+    content.append({"type": "text", "text": "Return the labels JSON, with one entry for every network id above."})
 
     response = client.messages.create(
-        model=model,
-        max_tokens=_MAX_TOKENS,
-        system=_NETWORK_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": content}],
-        tools=[_NETWORK_TOOL],
-        tool_choice={"type": "tool", "name": "record_network_labels"},
+        **_request_kwargs(
+            model=model, system=_NETWORK_SYSTEM_PROMPT, content=content, schema=_NETWORK_LABELS_SCHEMA
+        )
     )
     return _parse_network_response(response, networks)
 
@@ -407,20 +459,17 @@ def label_networks(
 def _parse_network_response(response, networks) -> dict[str, SystemLabel]:
     ids = {nw.id for nw in networks}
     out: dict[str, SystemLabel] = {}
-    for block in getattr(response, "content", []) or []:
-        if getattr(block, "type", None) != "tool_use" or getattr(block, "name", None) != "record_network_labels":
+    for item in _labels_from_response(response):
+        nid = item.get("network_id")
+        if nid not in ids:
             continue
-        for item in (getattr(block, "input", {}) or {}).get("labels", []):
-            nid = item.get("network_id")
-            if nid not in ids:
-                continue
-            out[nid] = SystemLabel(
-                system=str(item.get("system", "")).strip() or "(unnamed)",
-                measurable=bool(item.get("is_pipe", False)),
-                confidence=str(item.get("confidence", "low")).lower(),
-                ambiguous=bool(item.get("ambiguous", False)),
-                reasoning=item.get("reasoning"),
-            )
+        out[nid] = SystemLabel(
+            system=str(item.get("system", "")).strip() or "(unnamed)",
+            measurable=bool(item.get("is_pipe", False)),
+            confidence=str(item.get("confidence", "low")).lower(),
+            ambiguous=bool(item.get("ambiguous", False)),
+            reasoning=item.get("reasoning"),
+        )
     for nw in networks:
         out.setdefault(
             nw.id,
@@ -572,18 +621,20 @@ def takeoff_tables(networks, labels: dict[str, SystemLabel], geometry: SheetGeom
     return {"by_system_size": by, "detail": detail, "review": review_notes}
 
 
-def _load_legend_image(path: str, page: int) -> bytes:
-    """Read a legend image (any common raster) or rasterize a legend PDF page.
+def _load_legend_attachment(path: str, page: int) -> tuple[str, bytes]:
+    """Load the advisory legend as ``("pdf", bytes)`` or ``("image", bytes)``.
 
-    Always returns PNG bytes — the request advertises ``image/png`` for every
-    image block, so a ``.jpg``/``.webp`` legend must be re-encoded, not passed
-    through with a mislabeled media type.
+    A PDF legend page is extracted as a standalone single-page PDF and sent as
+    a native ``document`` block, so the model reads the page's real text layer
+    instead of OCR-ing a raster. Raster legends are re-encoded to PNG — the
+    image block advertises ``image/png``, so a ``.jpg``/``.webp`` legend must
+    not pass through with a mislabeled media type.
     """
-    from .geometry import image_file_to_png, render_page_png
+    from .geometry import extract_page_pdf, image_file_to_png
 
     if path.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff")):
-        return image_file_to_png(path)
-    return render_page_png(path, page, dpi=150)
+        return "image", image_file_to_png(path)
+    return "pdf", extract_page_pdf(path, page)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -686,14 +737,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     swatches = {c.style_key: render_style_swatch(c.style_key) for c in cands}
-    legend_image = _load_legend_image(args.legend, args.legend_page) if args.legend else None
+    legend_kind, legend_bytes = (
+        _load_legend_attachment(args.legend, args.legend_page) if args.legend else (None, None)
+    )
 
     labels = label_styles(
         geom,
         ppf=ppf,
         discipline=args.discipline,
         style_images=swatches,
-        legend_image=legend_image,
+        legend_image=legend_bytes if legend_kind == "image" else None,
+        legend_pdf=legend_bytes if legend_kind == "pdf" else None,
         max_styles=args.max_styles,
     )
     feet = measure.linear_feet_by_style(geom, ppf) if ppf else {}

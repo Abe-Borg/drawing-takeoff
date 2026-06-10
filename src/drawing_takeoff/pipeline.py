@@ -44,6 +44,7 @@ def takeoff_for_sheet(
     client=None,
     scale_label: str | None = None,
     legend_image: bytes | None = None,
+    legend_pdf: bytes | None = None,
     discipline: str = "construction",
 ) -> tuple[list[TakeoffItem], list[str]]:
     """Measure + label one sheet into ``(items, diagnostics)``.
@@ -70,7 +71,7 @@ def takeoff_for_sheet(
     # *confidently* background is flagged for review, never guessed or discarded.
     labels = legend.label_styles(
         geom, client=client, ppf=ppf, discipline=discipline, legend_image=legend_image,
-        max_styles=min(max(len(feet), 1), _MAX_LABELLED_STYLES),
+        legend_pdf=legend_pdf, max_styles=min(max(len(feet), 1), _MAX_LABELLED_STYLES),
     )
 
     def _item(style, lf, *, system, confidence, ambiguous, reasoning):
@@ -119,6 +120,7 @@ def extract_takeoff(
     progress: Callable[[int, int, str], None] | None = None,
     scale_label: str | None = None,
     legend_image: bytes | None = None,
+    legend_pdf: bytes | None = None,
     discipline: str = "construction",
 ) -> TakeoffResult:
     """Run a linear-length takeoff over ``pdf_paths`` and return a result.
@@ -131,6 +133,8 @@ def extract_takeoff(
         scale_label: override applied to every sheet (scale is consistent across
             a set); when ``None`` each sheet's own detected label is used.
         legend_image: optional PNG of the lead sheet's legend (advisory).
+        legend_pdf: optional single-page PDF of the legend (advisory; preferred
+            over ``legend_image`` — it carries the page's text layer).
         discipline: e.g. ``"fire protection"`` — guides the legend.
     """
     from .geometry import extract_pdf_geometry  # deferred: only this needs PyMuPDF
@@ -154,6 +158,7 @@ def extract_takeoff(
                 client=client,
                 scale_label=scale_label,
                 legend_image=legend_image,
+                legend_pdf=legend_pdf,
                 discipline=discipline,
             )
             result.items.extend(items)
