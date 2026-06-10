@@ -31,6 +31,10 @@ __all__ = ["extract_takeoff"]
 _MAX_LABELLED_STYLES = 40
 
 
+def _noop(_message: str) -> None:
+    """Default ``log`` sink — swallows messages when no callback is supplied."""
+
+
 def _resolve_ppf(geom: SheetGeometry, scale_label: str | None) -> float | None:
     """Scale override (consistent across a set) wins over the sheet's own label."""
     if scale_label:
@@ -47,13 +51,18 @@ def takeoff_for_sheet(
     legend_pdf: bytes | None = None,
     legend_block: dict | None = None,
     discipline: str = "construction",
+    log: Callable[[str], None] | None = None,
 ) -> tuple[list[TakeoffItem], list[str]]:
     """Measure + label one sheet into ``(items, diagnostics)``.
 
     Pure with respect to PyMuPDF — operates on a :class:`SheetGeometry` and a
     duck-typed ``client`` — so it is fully unit-testable. Raises if the sheet has
-    no usable scale (the caller records it as a per-sheet error).
+    no usable scale (the caller records it as a per-sheet error). ``log`` is an
+    optional sink for human-readable sub-step messages (e.g. "labeling N styles
+    with Claude…") so a front-end can show the run is alive during the long
+    vision call.
     """
+    log = log or _noop
     sheet_id = f"{geom.ref.source}#p{geom.ref.page_index}"
     ppf = _resolve_ppf(geom, scale_label)
     diagnostics = [
@@ -62,10 +71,17 @@ def takeoff_for_sheet(
     ]
     if not ppf:
         raise ValueError(f"{sheet_id}: no scale detected (confirm the scale and re-run)")
+    log(f"{sheet_id}: scale {geom.scale_label or scale_label or 'unknown'} → {ppf:g} pt/ft; measuring geometry…")
 
     # M2: border-excluded runs per style -> footage + run counts (one stitch pass).
     runs_by = measure.runs_by_style(geom, ppf=ppf, exclude_border=True)
     feet = {s: sum(r.length_pt for r in rs) / ppf for s, rs in runs_by.items() if rs}
+    n_styles = min(max(len(feet), 1), _MAX_LABELLED_STYLES)
+    log(
+        f"{sheet_id}: {len(feet)} line style(s), "
+        f"{sum(len(rs) for rs in runs_by.values())} run(s) measured; "
+        f"labeling {n_styles} with Claude… (this can take a moment)"
+    )
 
     # M3: name EVERY measured style (cap high enough that footage is never
     # silently dropped by the label limit). The legend is advisory; anything not
@@ -73,7 +89,7 @@ def takeoff_for_sheet(
     labels = legend.label_styles(
         geom, client=client, ppf=ppf, discipline=discipline, legend_image=legend_image,
         legend_pdf=legend_pdf, legend_block=legend_block,
-        max_styles=min(max(len(feet), 1), _MAX_LABELLED_STYLES),
+        max_styles=n_styles,
     )
 
     def _item(style, lf, *, system, confidence, ambiguous, reasoning):
@@ -100,9 +116,9 @@ def takeoff_for_sheet(
         # else: confidently non-measurable (background / text / symbols) — correctly excluded.
 
     n_trusted = sum(1 for i in items if i.trusted)
-    diagnostics.append(
-        f"{sheet_id}: {n_trusted} trusted, {len(items) - n_trusted} flagged, of {len(feet)} measured styles"
-    )
+    msg = f"{sheet_id}: {n_trusted} trusted, {len(items) - n_trusted} flagged, of {len(feet)} measured styles"
+    diagnostics.append(msg)
+    log(msg)
     return items, diagnostics
 
 
@@ -120,6 +136,7 @@ def extract_takeoff(
     *,
     client=None,
     progress: Callable[[int, int, str], None] | None = None,
+    log: Callable[[str], None] | None = None,
     scale_label: str | None = None,
     legend_image: bytes | None = None,
     legend_pdf: bytes | None = None,
@@ -131,7 +148,13 @@ def extract_takeoff(
         pdf_paths: input PDF sheet paths, processed in page order.
         client: duck-typed Anthropic client for the legend step (injected in
             tests); ``None`` resolves the vendored default at call time.
-        progress: optional ``progress(done, total, label)`` callback.
+        progress: optional ``progress(done, total, label)`` callback — one tick
+            per sheet, for a progress bar.
+        log: optional ``log(message)`` sink for human-readable detail *within* a
+            sheet (reading the PDF, measuring geometry, the long Claude vision
+            call, per-sheet results). ``progress`` alone leaves a multi-second
+            vision call looking frozen; ``log`` is what a GUI streams so the run
+            visibly stays alive.
         scale_label: override applied to every sheet (scale is consistent across
             a set); when ``None`` each sheet's own detected label is used.
         legend_image: optional PNG of the lead sheet's legend (advisory).
@@ -141,16 +164,20 @@ def extract_takeoff(
     """
     from .geometry import extract_pdf_geometry  # deferred: only this needs PyMuPDF
 
+    log = log or _noop
     result = TakeoffResult()
     sheets: list[SheetGeometry] = []
     for path in pdf_paths:
+        log(f"Reading {Path(path).name}…")
         try:
             sheets.extend(extract_pdf_geometry(str(path)))
         except Exception as exc:  # one unreadable PDF must not sink the run
             result.errors.append(f"{path}: could not read PDF ({exc})")
+            log(f"{Path(path).name}: could not read PDF ({exc})")
 
     total = len(sheets)
     result.sheet_count = total
+    log(f"{total} sheet(s) to process from {len(pdf_paths)} file(s).")
 
     # Multi-sheet sets reuse the legend: upload it once via the Files API and
     # reference the file_id from every per-sheet request instead of re-sending
@@ -162,17 +189,24 @@ def extract_takeoff(
             from .client import get_client  # deferred: tests inject a fake
 
             client = get_client()
+        log("Uploading the legend once via the Files API…")
         legend_block = legend.upload_legend(client, legend_pdf=legend_pdf, legend_image=legend_image)
         if legend_block is not None:
-            result.diagnostics.append(
+            msg = (
                 f"legend uploaded once via Files API "
                 f"(file_id={legend_block['source']['file_id']}, reused on {total} sheets)"
             )
+            result.diagnostics.append(msg)
+            log(msg)
+        else:
+            log("Legend upload unavailable; sending it inline with each sheet.")
 
     try:
         for i, geom in enumerate(sheets):
+            name = f"{Path(geom.ref.source).name} p{geom.ref.page_index}"
             if progress is not None:
-                progress(i, total, f"{Path(geom.ref.source).name} p{geom.ref.page_index}")
+                progress(i, total, name)
+            log(f"[{i + 1}/{total}] {name}")
             try:
                 items, diag = takeoff_for_sheet(
                     geom,
@@ -182,16 +216,19 @@ def extract_takeoff(
                     legend_pdf=legend_pdf,
                     legend_block=legend_block,
                     discipline=discipline,
+                    log=log,
                 )
                 result.items.extend(items)
                 result.diagnostics.extend(diag)
             except Exception as exc:
                 result.errors.append(str(exc))
                 result.diagnostics.append(f"{geom.ref.source}#p{geom.ref.page_index}: ERROR {exc}")
+                log(f"{name}: ERROR {exc}")
     finally:
         legend.delete_uploaded_legend(client, legend_block)
 
     if progress is not None:
         progress(total, total, "done")
+    log("Aggregating cross-sheet totals…")
     result.per_system_totals = _aggregate(result.items)
     return result
