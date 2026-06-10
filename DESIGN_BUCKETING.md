@@ -256,6 +256,7 @@ Still open:
 |---|---|---|
 | Connectivity over/under-merges | networks span systems or shatter | endpoint-to-segment joins + scale-aware ~0.5 ft tol (M5, validated on real sheets); crossover disambiguation deferred; LLM `structure_edit` ops; overlay makes it visible |
 | Candidate pipe set contaminated | a non-pipe style inflates the total, or a pipe lineweight is missed | M7 style pass selects **confident** (trusted) pipe styles; measurable-but-ambiguous styles are flagged "to confirm", not counted; non-pipe summarized — none silently dropped |
+| Top-N network cap crowds a busy/mixed sheet | a dominant linear system (e.g. duct/wall) pushes a real network into the unlabeled remainder | scope is **general linear takeoff** (user choice — systems split on the System axis); `NOT LABELED` + `NOT REVIEWED` surface the remainder, never silently dropped; raise `--top` / `--max-styles`. A label-aware cap is future work |
 | Size mis-attributed (a bare-number tag near the wrong run) | a size segment is wrong | FP-size-set + adjacency filter (M6); unsized remainder first-class; M7 LLM normalizes; the per-network **total** is unaffected |
 | Too many networks for set-of-marks | unreadable overlay, poor grounding | hierarchical labeling (region → network); number only candidates |
 | LLM tempted to emit quantities | trust collapse | contract forbids numbers; tools own all math; aggregation ignores any number the model returns |
