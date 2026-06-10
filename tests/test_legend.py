@@ -260,6 +260,109 @@ def test_label_networks_routes_dense_sheets_to_opus():
     assert captured["model"] == "custom-model"
 
 
+# ---- second look: close-up re-check of flagged networks -------------------
+def test_needs_second_look_policy():
+    def lab(**kw):
+        return SystemLabel(system="X", **kw)
+
+    assert legend.needs_second_look(lab(measurable=True, confidence="low", ambiguous=False))
+    assert legend.needs_second_look(lab(measurable=True, confidence="high", ambiguous=True))
+    assert legend.needs_second_look(lab(measurable=False, confidence="low", ambiguous=True))
+    # settled labels — trusted pipe and a confident non-pipe exclusion — are not re-checked
+    assert not legend.needs_second_look(lab(measurable=True, confidence="high", ambiguous=False))
+    assert not legend.needs_second_look(lab(measurable=False, confidence="high", ambiguous=False))
+
+
+def test_second_look_attaches_crops_and_marks_provenance():
+    nets = [_network("N0", ((0, 0), (100, 0))), _network("N1", ((0, 50), (100, 50)))]
+    first = {
+        "N0": SystemLabel(system="FP?", measurable=True, confidence="low", ambiguous=True, reasoning="unsure"),
+        "N1": SystemLabel(system="FP?", measurable=True, confidence="low", ambiguous=True, reasoning="unsure"),
+    }
+    captured = {}
+
+    def resp(kw):
+        captured.update(kw)
+        return _labels_message([
+            {"network_id": "N0", "system": "Fire-protection sprinkler", "is_pipe": True,
+             "confidence": "high", "ambiguous": False, "reasoning": "branches tee off the main"},
+            # N1 deliberately omitted — must stay flagged, never silently trusted.
+        ])
+
+    out = legend.second_look_networks(
+        _net_geom(), nets, first, {"N0": b"\x89PNG-crop0", "N1": b"\x89PNG-crop1"},
+        client=FakeClient(resp), discipline="fire protection",
+    )
+    from drawing_takeoff.core import api_config as _ac
+    assert captured["model"] == _ac.LABELING_ESCALATION_MODEL_DEFAULT
+    content = captured["messages"][0]["content"]
+    assert [b.get("type") for b in content].count("image") == 2  # both crops attached
+    texts = " ".join(b.get("text", "") for b in content if b.get("type") == "text")
+    assert "First-pass labels" in texts  # prior labels given as context
+    assert out["N0"].trusted and out["N0"].reasoning.startswith("second look:")
+    assert out["N1"].ambiguous and not out["N1"].measurable
+
+
+def test_second_look_without_crops_makes_no_call():
+    nets = [_network("N0", ((0, 0), (100, 0)))]
+    sentinel = FakeClient(lambda kw: (_ for _ in ()).throw(AssertionError("no crops -> no call")))
+    assert legend.second_look_networks(_net_geom(), nets, {}, {}, client=sentinel) == {}
+
+
+# ---- Files API legend upload ----------------------------------------------
+def test_upload_legend_pdf_returns_document_file_block():
+    client = FakeClient(lambda kw: _labels_message([]), with_files=True)
+    block = legend.upload_legend(client, legend_pdf=b"%PDF-fake")
+    assert block["type"] == "document" and block["source"]["type"] == "file"
+    name, _, media = client.beta.files.uploads[0]["file"]
+    assert name == "legend.pdf" and media == "application/pdf"
+
+
+def test_upload_legend_image_returns_image_file_block():
+    client = FakeClient(lambda kw: _labels_message([]), with_files=True)
+    block = legend.upload_legend(client, legend_image=b"\x89PNG-legend")
+    assert block["type"] == "image" and block["source"]["type"] == "file"
+
+
+def test_upload_legend_falls_back_without_files_api_or_on_failure():
+    no_files = FakeClient(lambda kw: _labels_message([]))
+    assert legend.upload_legend(no_files, legend_pdf=b"%PDF") is None
+    assert legend.upload_legend(no_files) is None
+
+    failing = FakeClient(lambda kw: _labels_message([]), with_files=True)
+    failing.beta.files.upload = lambda **kw: (_ for _ in ()).throw(RuntimeError("boom"))
+    assert legend.upload_legend(failing, legend_pdf=b"%PDF") is None
+
+
+def test_delete_uploaded_legend_is_best_effort():
+    client = FakeClient(lambda kw: _labels_message([]), with_files=True)
+    legend.delete_uploaded_legend(client, {"type": "document", "source": {"type": "file", "file_id": "f1"}})
+    assert client.beta.files.deleted == ["f1"]
+    legend.delete_uploaded_legend(client, None)  # no block -> no-op
+    legend.delete_uploaded_legend(FakeClient(lambda kw: _labels_message([])),
+                                  {"type": "document", "source": {"type": "file", "file_id": "f2"}})  # no Files API -> no raise
+
+
+def test_label_styles_legend_block_wins_and_carries_files_beta(geom):
+    captured = {}
+
+    def responder(kwargs):
+        captured.update(kwargs)
+        return _responder_only_s0(kwargs)
+
+    block = {"type": "document", "source": {"type": "file", "file_id": "file_123"}}
+    legend.label_styles(
+        geom, client=FakeClient(responder), legend_block=block, legend_pdf=b"%PDF-unused",
+    )
+    content = captured["messages"][0]["content"]
+    docs = [b for b in content if b.get("type") == "document"]
+    assert docs == [block]  # the file reference, not the inline bytes
+    assert captured["extra_headers"] == {"anthropic-beta": "files-api-2025-04-14"}
+    # the advisory framing travels with the block regardless of transport
+    caption = content[content.index(block) - 1]
+    assert "advisory" in caption["text"]
+
+
 def test_system_size_takeoff_buckets_trusted_and_reviews_rest():
     geom = _net_geom(words=[TextWord("2", (50, 2, 56, 8))])     # 2" tag on N0's run
     n0 = _network("N0", ((0, 0), (100, 0)))

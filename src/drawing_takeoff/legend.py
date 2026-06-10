@@ -24,9 +24,10 @@ Anthropic client is duck-typed and injectable for hermetic tests.
 from __future__ import annotations
 
 import base64
+import io
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from . import measure
 from .core import api_config
@@ -177,14 +178,21 @@ def _document_block(pdf_bytes: bytes) -> dict:
     }
 
 
-def _request_kwargs(*, model: str, system: str, content: list[dict], schema: dict) -> dict:
+_FILES_API_BETA = "files-api-2025-04-14"
+
+
+def _request_kwargs(*, model: str, system: str, content: list[dict], schema: dict, client=None) -> dict:
     """Assemble the structured-output labeling request (shared by M3 and M7).
 
     The JSON-schema response format rides ``output_config`` next to the
     central effort policy, and adaptive thinking is attached per
     ``api_config.PHASE_LABELING`` — the schema stays enforced without a forced
-    tool call, which thinking does not allow.
+    tool call, which thinking does not allow. An unknown model id is resolved
+    against the Models API first (once per process) so an env-pinned newer
+    model gets its real capabilities. Content referencing a Files API
+    ``file_id`` makes the request carry the files beta header.
     """
+    api_config.ensure_model_registered(model, client=client)
     kwargs: dict = {
         "model": model,
         "max_tokens": api_config.phase_output_cap(api_config.PHASE_LABELING, model=model),
@@ -194,7 +202,57 @@ def _request_kwargs(*, model: str, system: str, content: list[dict], schema: dic
     output_config = api_config.effort_config_for(model=model, phase=api_config.PHASE_LABELING) or {}
     output_config["format"] = {"type": "json_schema", "schema": schema}
     kwargs["output_config"] = output_config
+    if any(
+        isinstance(b, dict) and (b.get("source") or {}).get("type") == "file" for b in content
+    ):
+        kwargs["extra_headers"] = {"anthropic-beta": _FILES_API_BETA}
     return api_config.apply_thinking_config(kwargs, model=model, phase=api_config.PHASE_LABELING)
+
+
+def upload_legend(client, *, legend_pdf: bytes | None = None, legend_image: bytes | None = None) -> dict | None:
+    """Upload the advisory legend once via the Files API; return a reusable block.
+
+    On a multi-sheet set the same legend bytes otherwise re-upload inside every
+    per-sheet request; a one-time ``client.beta.files.upload`` turns that into
+    a small ``file_id`` reference. Returns the content block to pass as
+    ``legend_block``, or ``None`` (nothing to upload, client without a Files
+    API, or upload failure) — callers fall back to inline bytes.
+
+    This changes the legend's *transport only*. The legend stays ADVISORY:
+    :func:`label_styles` attaches the same reconcile-don't-trust caption ahead
+    of the block either way, and the system prompt's unreliable-legend framing
+    is unconditional.
+    """
+    if not (legend_pdf or legend_image):
+        return None
+    upload = getattr(getattr(getattr(client, "beta", None), "files", None), "upload", None)
+    if not callable(upload):
+        return None
+    if legend_pdf:
+        name, data, media, kind = "legend.pdf", legend_pdf, "application/pdf", "document"
+    else:
+        name, data, media, kind = "legend.png", legend_image, "image/png", "image"
+    try:
+        uploaded = upload(file=(name, io.BytesIO(data), media))
+    except Exception as exc:
+        _log.warning("Files API legend upload failed (%s); falling back to inline bytes.", exc)
+        return None
+    return {"type": kind, "source": {"type": "file", "file_id": uploaded.id}}
+
+
+def delete_uploaded_legend(client, legend_block: dict | None) -> None:
+    """Best-effort cleanup of a block from :func:`upload_legend` (files persist
+    until deleted). Never raises — a failed delete must not sink a finished run."""
+    if not legend_block:
+        return
+    file_id = (legend_block.get("source") or {}).get("file_id")
+    delete = getattr(getattr(getattr(client, "beta", None), "files", None), "delete", None)
+    if not file_id or not callable(delete):
+        return
+    try:
+        delete(file_id)
+    except Exception as exc:
+        _log.warning("Files API legend cleanup failed for %s (%s); the file persists.", file_id, exc)
 
 
 def _labels_from_response(response) -> list[dict]:
@@ -225,6 +283,7 @@ def label_styles(
     style_images: dict[StyleKey, bytes] | None = None,
     legend_image: bytes | None = None,
     legend_pdf: bytes | None = None,
+    legend_block: dict | None = None,
     max_styles: int = 12,
     model: str | None = None,
 ) -> dict[StyleKey, SystemLabel]:
@@ -234,11 +293,14 @@ def label_styles(
     when ``None`` the vendored :func:`drawing_takeoff.client.get_client` is used.
     ``style_images`` are optional PNG bytes (rendered by
     :mod:`drawing_takeoff.geometry`); the call also works on the text stats
-    alone. The advisory legend attaches as ``legend_pdf`` (single-page PDF
-    bytes, preferred — a native ``document`` block carries the page's real
-    text layer) or ``legend_image`` (PNG bytes, for raster legends); when both
-    are given the PDF wins. Styles the model omits default to an ambiguous,
-    low-confidence label so nothing is silently trusted.
+    alone. The advisory legend attaches as ``legend_block`` (a Files API
+    reference from :func:`upload_legend`, preferred on multi-sheet sets),
+    ``legend_pdf`` (single-page PDF bytes — a native ``document`` block carries
+    the page's real text layer), or ``legend_image`` (PNG bytes, for raster
+    legends), in that precedence. However it travels, the legend is captioned
+    and prompted as ADVISORY — reconciled against the geometry, never trusted
+    outright. Styles the model omits default to an ambiguous, low-confidence
+    label so nothing is silently trusted.
     """
     if ppf is None:
         ppf = geometry.points_per_foot
@@ -269,7 +331,7 @@ def label_styles(
             if img:
                 content.append({"type": "text", "text": f"Swatch for {c.style_id}:"})
                 content.append(_image_block(img))
-    if legend_pdf or legend_image:
+    if legend_block or legend_pdf or legend_image:
         content.append(
             {
                 "type": "text",
@@ -277,13 +339,20 @@ def label_styles(
                 "(advisory — reconcile against the drawing, do not trust blindly):",
             }
         )
-        content.append(_document_block(legend_pdf) if legend_pdf else _image_block(legend_image))
+        if legend_block:
+            content.append(legend_block)
+        elif legend_pdf:
+            content.append(_document_block(legend_pdf))
+        else:
+            content.append(_image_block(legend_image))
     content.append(
         {"type": "text", "text": "Return the labels JSON, with one entry for every style id above."}
     )
 
     response = client.messages.create(
-        **_request_kwargs(model=model, system=_SYSTEM_PROMPT, content=content, schema=_LABELS_SCHEMA)
+        **_request_kwargs(
+            model=model, system=_SYSTEM_PROMPT, content=content, schema=_LABELS_SCHEMA, client=client
+        )
     )
 
     return _parse_response(response, id_to_style)
@@ -450,7 +519,8 @@ def label_networks(
 
     response = client.messages.create(
         **_request_kwargs(
-            model=model, system=_NETWORK_SYSTEM_PROMPT, content=content, schema=_NETWORK_LABELS_SCHEMA
+            model=model, system=_NETWORK_SYSTEM_PROMPT, content=content,
+            schema=_NETWORK_LABELS_SCHEMA, client=client,
         )
     )
     return _parse_network_response(response, networks)
@@ -477,6 +547,101 @@ def _parse_network_response(response, networks) -> dict[str, SystemLabel]:
                         reasoning="No label returned for this network."),
         )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Second look: re-check flagged networks from high-DPI close-ups
+# ---------------------------------------------------------------------------
+_SECOND_LOOK_SYSTEM_PROMPT = """\
+You are a quantity-takeoff assistant for construction drawings. A first pass over the whole \
+sheet could not confidently place the pipe NETWORKS listed here — each was flagged for human \
+review. You now get a high-resolution CLOSE-UP of each flagged network (highlighted in color \
+and labeled with its id) showing detail the whole-sheet view blurs: tees and branch \
+connections, fittings, and nearby callouts. The first-pass label and reasoning are given as \
+context; confirm or overturn them based on what the close-up actually shows.
+
+The geometry stats are GROUND TRUTH — never recompute or second-guess the numbers. The same \
+rules as the first pass apply: branch lines teeing off a main or pipe sizes tagged along the \
+run mean real pipe; a sheet-spanning line with no branches is likely a matchline or border \
+(`is_pipe` false). If the close-up still does not settle it, keep `ambiguous` true and \
+`confidence` low — a human reviews every flagged network; never guess.
+
+Reply with the labels JSON (the response format is enforced): a `labels` array \
+with exactly one entry for every network id given."""
+
+
+def needs_second_look(label: SystemLabel) -> bool:
+    """Review-list membership — what the close-up re-check should target.
+
+    Ambiguous either way, or measurable but below the trust bar. A confident
+    non-pipe exclusion (e.g. a high-confidence matchline) is settled, not
+    flagged, so it is not re-checked.
+    """
+    return label.ambiguous or (label.measurable and not label.trusted)
+
+
+def second_look_networks(
+    geometry: SheetGeometry,
+    networks,
+    first_pass: dict[str, SystemLabel],
+    crops: dict[str, bytes],
+    *,
+    client=None,
+    discipline: str = "construction",
+    model: str | None = None,
+) -> dict[str, SystemLabel]:
+    """Re-label flagged networks from high-DPI close-ups, in one focused call.
+
+    ``networks`` is the flagged subset (see :func:`needs_second_look`) and
+    ``crops`` maps network id -> close-up PNG from
+    :func:`drawing_takeoff.geometry.render_network_crop_png` — the surgical
+    replacement for blanket sheet tiling: the engine knows exactly where each
+    ambiguity lives, so only that region is rendered at high DPI. Defaults to
+    the escalation model (flagged cases are by definition the hard ones).
+    Returns labels for the given ids only — callers merge over the first pass
+    with ``labels.update(...)``. Reasoning is prefixed ``second look:`` so the
+    review surfaces show which pass produced each label, and a network the
+    model omits (or that has no crop) keeps a flagged default — the re-check
+    can only refine the review list, never silently widen trust.
+    """
+    networks = [nw for nw in networks if nw.id in crops]
+    if not networks:
+        return {}
+    if model is None:
+        model = api_config.LABELING_ESCALATION_MODEL_DEFAULT
+    if client is None:
+        from .client import get_client
+
+        client = get_client()
+
+    content: list[dict] = [{"type": "text", "text": network_facts(geometry, networks, discipline=discipline)}]
+    notes = []
+    for nw in networks:
+        lab = first_pass.get(nw.id)
+        if lab is not None:
+            notes.append(
+                f"  {nw.id}: first pass said {lab.system!r} (is_pipe={lab.measurable}, "
+                f"confidence={lab.confidence}, ambiguous={lab.ambiguous})"
+                + (f" — {lab.reasoning}" if lab.reasoning else "")
+            )
+    if notes:
+        content.append({"type": "text", "text": "First-pass labels (flagged for review):\n" + "\n".join(notes)})
+    for nw in networks:
+        content.append({"type": "text", "text": f"Close-up of {nw.id}:"})
+        content.append(_image_block(crops[nw.id]))
+    content.append({"type": "text", "text": "Return the labels JSON, with one entry for every network id above."})
+
+    response = client.messages.create(
+        **_request_kwargs(
+            model=model, system=_SECOND_LOOK_SYSTEM_PROMPT, content=content,
+            schema=_NETWORK_LABELS_SCHEMA, client=client,
+        )
+    )
+    out = _parse_network_response(response, networks)
+    return {
+        nid: replace(lab, reasoning=f"second look: {lab.reasoning}" if lab.reasoning else "second look")
+        for nid, lab in out.items()
+    }
 
 
 def pipe_runs_from_style_labels(runs_by, style_labels):
@@ -678,6 +843,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--system-size", action="store_true",
                     help="M7: label the connected networks and print the System x Size takeoff")
     ap.add_argument("--top", type=int, default=8, help="largest N networks to label (with --system-size)")
+    ap.add_argument("--no-second-look", action="store_true",
+                    help="skip the high-DPI close-up re-check of flagged networks (with --system-size)")
     ap.add_argument("--out", default=None, help="with --system-size: also write takeoff.xlsx + a marked-up PDF here")
     args = ap.parse_args(argv)
 
@@ -714,6 +881,16 @@ def main(argv: list[str] | None = None) -> int:
         nets = all_nets[: args.top]
         image = render_networks_png(args.pdf, args.page, nets)
         labels = label_networks(geom, nets, image=image, discipline=args.discipline)
+
+        # Second look: re-check what the first pass flagged, from high-DPI
+        # close-ups of just those networks (the engine knows where each
+        # ambiguity lives, so only that region is rendered large).
+        flagged = [nw for nw in nets if needs_second_look(labels[nw.id])]
+        if flagged and not args.no_second_look:
+            from .geometry import render_network_crop_png
+
+            crops = {nw.id: render_network_crop_png(args.pdf, args.page, nw) for nw in flagged}
+            labels.update(second_look_networks(geom, flagged, labels, crops, discipline=args.discipline))
 
         extra: list[str] = []
         remainder = all_nets[args.top:]

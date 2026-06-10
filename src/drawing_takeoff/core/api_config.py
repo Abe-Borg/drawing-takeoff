@@ -15,6 +15,9 @@ Model identifiers may be overridden via env vars:
                                               Sonnet 4.6).
     DRAWING_TAKEOFF_LABELING_DENSE_MODEL        — labeling of dense sheets
                                               (default Opus 4.8).
+    DRAWING_TAKEOFF_LABELING_ESCALATION_MODEL   — second-look re-check of
+                                              flagged networks (default
+                                              Opus 4.8).
 """
 from __future__ import annotations
 
@@ -64,6 +67,14 @@ TRIAGE_MODEL_DEFAULT = os.environ.get("DRAWING_TAKEOFF_TRIAGE_MODEL", MODEL_HAIK
 LABELING_MODEL_DEFAULT = os.environ.get("DRAWING_TAKEOFF_LABELING_MODEL", MODEL_SONNET_46)
 LABELING_DENSE_MODEL_DEFAULT = os.environ.get(
     "DRAWING_TAKEOFF_LABELING_DENSE_MODEL", MODEL_OPUS_48
+)
+
+# Second-look escalation (legend.second_look_networks): networks the first
+# pass flagged are by definition the hard cases, so the close-up re-check
+# defaults to the strongest tier — mirroring the verification escalation
+# split (Sonnet first, Opus on what survives).
+LABELING_ESCALATION_MODEL_DEFAULT = os.environ.get(
+    "DRAWING_TAKEOFF_LABELING_ESCALATION_MODEL", MODEL_OPUS_48
 )
 
 
@@ -272,6 +283,11 @@ class ModelCapabilities:
     # :func:`effort_config_for` must consult this flag before attaching
     # the field. Default ``False`` so unknown models silently omit it.
     supports_effort: bool = False
+    # Whether the model accepts the ``xhigh`` effort level (Opus-tier only
+    # today). :func:`_clamp_effort_for_model` consults this so a phase that
+    # defaults to ``xhigh`` degrades to ``high`` instead of a 400 on models
+    # without it. Default ``False`` — clamping is always safe.
+    supports_effort_xhigh: bool = False
 
 
 _MODEL_CAPABILITIES: dict[str, ModelCapabilities] = {
@@ -288,6 +304,7 @@ _MODEL_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_extended_output_beta=True,
         context_window=1_000_000,
         supports_effort=True,
+        supports_effort_xhigh=True,
     ),
     MODEL_SONNET_46: ModelCapabilities(
         supports_adaptive_thinking=True,
@@ -372,6 +389,83 @@ def model_capabilities(model: str) -> ModelCapabilities:
         return caps
     _warn_unknown_model(model)
     return _DEFAULT_CAPABILITIES
+
+
+# ---------------------------------------------------------------------------
+# Models API registration (live capability discovery)
+# ---------------------------------------------------------------------------
+#
+# The static whitelist above goes stale the day Anthropic ships a model: an
+# operator who pins a newer id via ``DRAWING_TAKEOFF_*_MODEL`` used to get the
+# conservative defaults (no thinking, no effort, 64k cap) plus a warning. The
+# Models API (``client.models.retrieve``) reports the real capability tree, so
+# an unknown id is now resolved live — once per process — and registered with
+# its actual capabilities. The static table stays as the offline fallback and
+# the source of truth for what the API can't report (the 300k batch beta).
+
+# Ids we already asked the Models API about (hit or miss) — the lookup sits on
+# the per-request path, so it must run at most once per id per process.
+_LIVE_LOOKUP_ATTEMPTED: set[str] = set()
+
+
+def _capabilities_from_models_api(info) -> ModelCapabilities:
+    """Map a Models API record onto :class:`ModelCapabilities`.
+
+    ``info.capabilities`` is documented as an untyped nested dict with a
+    ``supported`` bool at each leaf, but the walker also tolerates typed
+    SDK objects (attribute access) at any level — if a future SDK release
+    models the tree, the failure mode would otherwise be silently recording
+    every live model as capability-less, the exact degradation this path
+    exists to prevent. A missing branch reads as unsupported either way.
+    The 300k extended-output batch beta is not discoverable here, so it stays
+    off — strictly safer (the request simply won't ask for extended output).
+    """
+    tree = info.capabilities or {}
+
+    def supported(*path: str) -> bool:
+        node: object = tree
+        for key in (*path, "supported"):
+            node = node.get(key) if isinstance(node, dict) else getattr(node, key, None)
+            if node is None:
+                return False
+        return bool(node)
+
+    return ModelCapabilities(
+        supports_adaptive_thinking=supported("thinking", "types", "adaptive"),
+        max_output_tokens=int(info.max_tokens),
+        supports_extended_output_beta=False,
+        context_window=int(info.max_input_tokens),
+        supports_effort=supported("effort"),
+        supports_effort_xhigh=supported("effort", "xhigh"),
+    )
+
+
+def ensure_model_registered(model: str, *, client=None) -> None:
+    """Best-effort: resolve an unknown ``model`` via the Models API.
+
+    Known ids and previously-attempted ids return immediately, so the call is
+    a set lookup on the hot path. ``client`` is duck-typed; one without a
+    ``models.retrieve`` (e.g. the test fakes) is skipped silently and the id
+    falls through to the existing unknown-model warning path. A lookup failure
+    likewise warns and falls back — capability discovery must never sink a
+    request.
+    """
+    if model in _MODEL_CAPABILITIES or model in _LIVE_LOOKUP_ATTEMPTED or client is None:
+        return
+    retrieve = getattr(getattr(client, "models", None), "retrieve", None)
+    if not callable(retrieve):
+        return
+    _LIVE_LOOKUP_ATTEMPTED.add(model)
+    try:
+        caps = _capabilities_from_models_api(retrieve(model))
+    except Exception as exc:
+        _log.warning(
+            "Models API lookup for %r failed (%s); the id will degrade to the "
+            "conservative unknown-model defaults.", model, exc,
+        )
+        return
+    _MODEL_CAPABILITIES[model] = caps
+    _log.info("Registered %r from the Models API: %s", model, caps)
 
 
 def model_supports_adaptive_thinking(model: str) -> bool:
@@ -507,26 +601,25 @@ _VERIFICATION_PHASES: frozenset[str] = frozenset(
     }
 )
 
-# Effort levels only Opus 4.8 accepts. Sonnet 4.6's supported set is
-# ``{low, medium, high, max}``; it rejects ``xhigh`` at submit with a 400
+# Effort levels gated to models whose capability record carries
+# ``supports_effort_xhigh`` (the Opus tier today). Sonnet 4.6's supported set
+# is ``{low, medium, high, max}``; it rejects ``xhigh`` at submit with a 400
 # ("This model does not support effort level 'xhigh'"). Membership in this set
-# is the trigger for :func:`_clamp_effort_for_model` to downgrade to ``high``
-# on a non-Opus model. Keep it in sync with the levels Anthropic gates to the
-# Opus tier — adding a future Opus-only level here makes every phase clamp it
-# automatically on Sonnet.
-_OPUS_ONLY_EFFORT_LEVELS: frozenset[str] = frozenset({EFFORT_XHIGH})
+# is the trigger for :func:`_clamp_effort_for_model` to downgrade to ``high``.
+_XHIGH_EFFORT_LEVELS: frozenset[str] = frozenset({EFFORT_XHIGH})
 
 
 def _clamp_effort_for_model(level: str, model: str) -> str:
     """Clamp an effort ``level`` down to what ``model`` accepts.
 
-    ``xhigh`` is Opus-4.8-only; on any non-Opus model it falls back to
+    ``xhigh`` is accepted only where the capability registry says so (static
+    whitelist or a Models API registration); everywhere else it falls back to
     ``high`` — the deepest level Sonnet 4.6 accepts (we don't use ``max``).
     Every other level passes through unchanged. This is what keeps the
     cross-check phase (``xhigh`` default, but always Sonnet) from 400-ing at
     submit, and protects a Sonnet-overridden review phase the same way.
     """
-    if level in _OPUS_ONLY_EFFORT_LEVELS and model not in OPUS_MODELS:
+    if level in _XHIGH_EFFORT_LEVELS and not model_capabilities(model).supports_effort_xhigh:
         return EFFORT_HIGH
     return level
 
