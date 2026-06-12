@@ -1,7 +1,7 @@
-"""Thin desktop front-end over the headless takeoff engines (M4 + M7).
+"""Thin desktop front-end over the headless takeoff engines (M4 + M7 + M11).
 
 Drag in (or browse to) a set of vector PDFs, pick an output mode, confirm the
-scale, run, and save. The GUI owns no measurement logic — it runs one of the two
+scale, run, and save. The GUI owns no measurement logic — it runs one of the
 engine entry points on a worker thread, passes a ``progress(done, total, label)``
 callback, and marshals results back to the UI thread via ``self.after``:
 
@@ -11,8 +11,13 @@ callback, and marshals results back to the UI thread via ``self.after``:
     pipe-network detection + size callouts + a high-DPI second-look re-check,
     totaled by system AND nominal size, saved as an Excel workbook + one
     marked-up PDF per sheet (the ``legend --system-size`` CLI path).
+  * **Counts** — :func:`drawing_takeoff.pipeline.extract_count_takeoff`: repeated
+    symbols found + counted by congruence, named by Claude from exemplar crops,
+    totaled as EA per component, saved as an Excel workbook + one instance-markup
+    PDF per sheet (the ``count --label`` CLI path). One mode per run — the modes
+    are radio-style on purpose.
 
-An optional advisory legend (a lead-sheet PDF/image) attaches to either mode.
+An optional advisory legend (a lead-sheet PDF/image) attaches to any mode.
 
 The ``customtkinter`` / ``tkinterdnd2`` imports are guarded so importing this
 module (and the rest of the package) never requires the ``[gui]`` extra; run
@@ -30,8 +35,14 @@ from pathlib import Path
 from . import export, legend
 from .client import get_client
 from .core import api_key_store
-from .models import SystemSizeResult
-from .pipeline import extract_system_size_takeoff, extract_takeoff, write_system_size_export
+from .models import CountsResult, SystemSizeResult
+from .pipeline import (
+    extract_count_takeoff,
+    extract_system_size_takeoff,
+    extract_takeoff,
+    write_count_export,
+    write_system_size_export,
+)
 
 try:  # the GUI extras are optional; the engine never needs them
     import customtkinter as ctk
@@ -57,8 +68,9 @@ if _GUI:
     class TakeoffApp(*_APP_BASES):
         """A small drag-drop -> takeoff window with two output modes."""
 
-        # Segmented-button label -> internal mode key.
-        _MODES = {"By system": "system", "By system × size": "size"}
+        # Segmented-button label -> internal mode key. Radio semantics: one
+        # takeoff mode per run (lengths or counts, never both at once).
+        _MODES = {"By system": "system", "By system × size": "size", "Counts": "counts"}
 
         def __init__(self) -> None:
             super().__init__()
@@ -169,6 +181,25 @@ if _GUI:
             ctk.CTkCheckBox(self._size_frame, text="Second look (re-check flagged)",
                             variable=self._second_look).pack(side="left", padx=8)
 
+            # --- counts options (shown only in that mode) ------------------
+            self._counts_frame = ctk.CTkFrame(self)
+            ctk.CTkLabel(self._counts_frame, text="Counts:").pack(side="left", padx=6)
+            ctk.CTkLabel(self._counts_frame, text="top clusters").pack(side="left", padx=(6, 2))
+            self._top_clusters = ctk.CTkEntry(self._counts_frame, width=56)
+            self._top_clusters.insert(0, "12")
+            self._top_clusters.pack(side="left", padx=(0, 8))
+            ctk.CTkLabel(self._counts_frame, text="min repeats").pack(side="left", padx=(6, 2))
+            self._min_count = ctk.CTkEntry(self._counts_frame, width=56)
+            self._min_count.insert(0, "2")
+            self._min_count.pack(side="left", padx=(0, 8))
+            ctk.CTkLabel(self._counts_frame, text="max symbol ft").pack(side="left", padx=(6, 2))
+            self._max_extent = ctk.CTkEntry(self._counts_frame, width=56)
+            self._max_extent.insert(0, "4")
+            self._max_extent.pack(side="left", padx=(0, 8))
+            # Same second-look concept as System×Size — one shared toggle.
+            ctk.CTkCheckBox(self._counts_frame, text="Second look (re-check flagged)",
+                            variable=self._second_look).pack(side="left", padx=8)
+
             # --- run + progress -------------------------------------------
             self._run_frame = ctk.CTkFrame(self)
             self._run_frame.pack(fill="x", **pad)
@@ -200,14 +231,21 @@ if _GUI:
         # ----- mode ------------------------------------------------------
         def _on_mode(self, value: str) -> None:
             self._mode = self._MODES.get(value, "system")
+            self._size_frame.pack_forget()
+            self._counts_frame.pack_forget()
             if self._mode == "size":
                 self._size_frame.pack(fill="x", padx=10, pady=6, before=self._run_frame)
                 self._save_btn.configure(text="Save Excel + PDF…")
                 self._status.configure(
                     text="System × Size: detects pipe networks per sheet, totals LF by system and nominal size."
                 )
+            elif self._mode == "counts":
+                self._counts_frame.pack(fill="x", padx=10, pady=6, before=self._run_frame)
+                self._save_btn.configure(text="Save Excel + PDF…")
+                self._status.configure(
+                    text="Counts: finds + counts repeated symbols by congruence, names them, totals EA per component."
+                )
             else:
-                self._size_frame.pack_forget()
                 self._save_btn.configure(text="Save CSV…")
                 self._status.configure(
                     text="By system: totals trusted linear feet per system across the set."
@@ -260,6 +298,13 @@ if _GUI:
             except (TypeError, ValueError):
                 return default
 
+        @staticmethod
+        def _float(entry, default: float) -> float:
+            try:
+                return float(entry.get().strip())
+            except (TypeError, ValueError):
+                return default
+
         # ----- run on a worker thread ------------------------------------
         def _run(self) -> None:
             if not self._pdfs:
@@ -283,6 +328,9 @@ if _GUI:
                 "top": self._int(self._top, 8),
                 "max_styles": self._int(self._max_styles, 12),
                 "second_look": bool(self._second_look.get()),
+                "top_clusters": self._int(self._top_clusters, 12),
+                "min_count": self._int(self._min_count, 2),
+                "max_extent_ft": self._float(self._max_extent, 4.0),
             }
             # Heartbeat state so the activity log streams and the headline ticks an
             # elapsed-seconds counter through the long, event-less Claude call.
@@ -320,6 +368,13 @@ if _GUI:
                         pdfs, client=client, progress=progress, log=log, scale_label=scale, discipline=discipline,
                         legend_pdf=legend_pdf, legend_image=legend_image,
                         top=opts["top"], max_styles=opts["max_styles"], second_look=opts["second_look"],
+                    )
+                elif mode == "counts":
+                    result = extract_count_takeoff(
+                        pdfs, client=client, progress=progress, log=log, scale_label=scale, discipline=discipline,
+                        legend_pdf=legend_pdf, legend_image=legend_image,
+                        max_clusters=opts["top_clusters"], min_count=opts["min_count"],
+                        max_extent_ft=opts["max_extent_ft"], second_look=opts["second_look"],
                     )
                 else:
                     result = extract_takeoff(
@@ -403,11 +458,12 @@ if _GUI:
             self._run_btn.configure(state="normal")
             self._save_btn.configure(state="normal")
             self._progress.set(1)
-            text = (
-                self._render_system_size(result)
-                if isinstance(result, SystemSizeResult)
-                else self._render_by_system(result)
-            )
+            if isinstance(result, SystemSizeResult):
+                text = self._render_system_size(result)
+            elif isinstance(result, CountsResult):
+                text = self._render_counts(result)
+            else:
+                text = self._render_by_system(result)
             # The bottom textbox is the activity log; append the final summary
             # there (there is no separate results pane).
             self._logbox.insert("end", "\n" + "=" * 56 + "\n" + text + "\n")
@@ -461,10 +517,31 @@ if _GUI:
                 lines += [f"  {e}" for e in result.errors]
             return "\n".join(lines)
 
+        def _render_counts(self, result) -> str:
+            lines = [f"=== Counts takeoff: {result.sheet_count} sheet(s) ==="]
+            if result.per_component_totals:
+                lines.append("\nCOUNTS by component:")
+                lines += [f"  {c}: {n} EA" for c, n in result.per_component_totals.items()]
+            else:
+                lines.append("\n(no trusted countable symbols)")
+            if result.review:
+                lines.append("\nREVIEW (not counted / confirm — see the Review tab):")
+                lines += [f"  {r}" for r in result.review]
+            if result.errors:
+                lines.append("\nERRORS:")
+                lines += [f"  {e}" for e in result.errors]
+            return "\n".join(lines)
+
         def _save(self) -> None:
             if self._result is None:
                 return
-            if isinstance(self._result, SystemSizeResult):
+            if isinstance(self._result, CountsResult):
+                out = filedialog.askdirectory(title="Choose a folder for the counts export")
+                if not out:
+                    return
+                folder = write_count_export(self._result, out, project_name="counts")
+                messagebox.showinfo("drawing-takeoff", f"Saved Excel + instance-markup PDF(s) to:\n{folder}")
+            elif isinstance(self._result, SystemSizeResult):
                 out = filedialog.askdirectory(title="Choose a folder for the System × Size export")
                 if not out:
                     return
