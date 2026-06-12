@@ -799,6 +799,107 @@ def fixture_tag_counts(geometry: SheetGeometry) -> Counter:
 
 
 # ---------------------------------------------------------------------------
+# M11: counts assembly — clusters + LLM names -> {component: EA} + review
+# ---------------------------------------------------------------------------
+def counts_takeoff(clusters, labels: dict) -> tuple[dict[str, int], list[str]]:
+    """Join cluster counts (engine) with component names (LLM) into EA totals.
+
+    Only **trusted** countable clusters roll into ``by_component`` — sibling
+    clusters named alike (rotated variants, fused captures) sum under one
+    component, which is what reunifies a symbol the engine split. A confident
+    non-countable cluster (annotation) is excluded with a note, and an
+    ambiguous / low-confidence one is routed to review rather than counted.
+    The LLM supplied only names; every count traces to exact geometry.
+    """
+    by: dict[str, int] = {}
+    review: list[str] = []
+    for c in clusters:
+        lab = labels.get(c.id)
+        if lab is None or not lab.measurable:
+            why = "no label returned" if lab is None else f"not countable ({lab.system})"
+            review.append(
+                f"{c.id}: excluded — {why} — {c.count} instances"
+                + (f" [{lab.reasoning}]" if lab is not None and lab.reasoning else "")
+            )
+            continue
+        if not lab.trusted:
+            review.append(
+                f"{c.id}: {lab.system} flagged "
+                f"({lab.confidence}{', ambiguous' if lab.ambiguous else ''}) — {c.count} EA"
+            )
+            continue
+        by[lab.system] = by.get(lab.system, 0) + c.count
+        if c.variants > 1:
+            review.append(
+                f"CONFIRM (counted): {c.id} ({lab.system}) absorbed {c.variants} drawn "
+                f"variants — confirm they are one component."
+            )
+    return by, review
+
+
+def count_tables(clusters, labels: dict, geometry: SheetGeometry, *, ppf: float | None = None) -> dict:
+    """Assemble what the counts outputs need, as **plain data** (the Excel/PDF
+    writers never touch engine model types):
+
+      ``by_component`` — ``{component: EA}`` (trusted countable clusters only),
+      ``detail``       — one dict per cluster (id, component, countable, counted, …),
+      ``review``       — the not-counted / confirm notes.
+    """
+    if ppf is None:
+        ppf = geometry.points_per_foot
+    by, review = counts_takeoff(clusters, labels)
+    detail = []
+    for c in clusters:
+        lab = labels.get(c.id)
+        detail.append({
+            "cluster": c.id,
+            "component": lab.system if lab is not None else "(unlabeled)",
+            "countable": bool(lab is not None and lab.measurable),
+            "counted": bool(lab is not None and lab.trusted and lab.measurable),
+            "confidence": lab.confidence if lab is not None else "low",
+            "ambiguous": bool(lab is not None and lab.ambiguous),
+            "count": c.count,
+            "size": _fmt_size(c, ppf),
+            "variants": c.variants,
+            "reasoning": (lab.reasoning if lab is not None else "") or "",
+        })
+    return {"by_component": by, "detail": detail, "review": review}
+
+
+def build_counts_report(geometry: SheetGeometry, clusters, labels: dict, *,
+                        ppf: float | None = None) -> str:
+    """Per-sheet counts deliverable: EA by component + the review list."""
+    if ppf is None:
+        ppf = geometry.points_per_foot
+    by, review = counts_takeoff(clusters, labels)
+    lines = [
+        f"=== Counts takeoff: {geometry.ref.source} (page {geometry.ref.page_index}) ===",
+        "",
+        "COUNTS by component (trusted symbol clusters):",
+    ]
+    if by:
+        backing: dict[str, list[str]] = defaultdict(list)
+        for c in clusters:
+            lab = labels.get(c.id)
+            if lab is not None and lab.trusted and lab.measurable:
+                backing[lab.system].append(f"{c.id} x{c.count}")
+        for component, n in sorted(by.items(), key=lambda kv: -kv[1]):
+            lines.append(f"  {component}: {n} EA   [{', '.join(backing[component])}]")
+    else:
+        lines.append("  (no trusted countable clusters)")
+    if review:
+        lines += ["", "REVIEW (not counted / confirm):"] + [f"  {r}" for r in review]
+    tags = fixture_tag_counts(geometry).most_common(12)
+    if tags:
+        lines += [
+            "",
+            "ADVISORY tag cross-check (fixture-tag-shaped text): "
+            + ", ".join(f"{t} x{n}" for t, n in tags),
+        ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # M9 report + CLI (no LLM)
 # ---------------------------------------------------------------------------
 def _fmt_size(c: SymbolCluster, ppf: float | None) -> str:
@@ -879,24 +980,70 @@ def build_scan_report(geometry: SheetGeometry, scan: SymbolScan, *, top: int = 1
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI: the no-LLM congruence scan, or (with ``--label``) the full counts
+    takeoff — clusters named by Claude, EA totals, Excel + instance markup.
+
+      python -m drawing_takeoff.count SHEET.pdf [--markup OUT.pdf]
+      python -m drawing_takeoff.count SHEET.pdf --label [--legend LEAD.pdf] [--out DIR]
+    """
+    import os
+    import sys
+
     ap = argparse.ArgumentParser(
-        description="M9 symbol congruence scan (no LLM): repeated-shape clusters with exact counts."
+        description="Symbol counts: congruence scan (no LLM), or --label for the named EA takeoff."
     )
     ap.add_argument("pdf", help="path to the vector PDF sheet")
     ap.add_argument("--page", type=int, default=0, help="0-based page index (default 0)")
-    ap.add_argument("--top", type=int, default=12, help="clusters to show (default %(default)s)")
+    ap.add_argument("--top", type=int, default=12,
+                    help="clusters to show / send for naming (default %(default)s)")
     ap.add_argument("--min-count", type=int, default=_DEFAULT_MIN_COUNT,
                     help="repeat floor for a cluster (default %(default)s; 1 includes one-offs)")
     ap.add_argument("--max-extent-ft", type=float, default=_DEFAULT_MAX_EXTENT_FT,
                     help="suspect extent cap in feet at sheet scale (default %(default)s)")
     ap.add_argument("--markup", default=None,
                     help="also write a PDF with every instance of the top clusters boxed + labeled")
-    ap.add_argument("--out", default=None, help="also write the report to this file")
+    ap.add_argument("--label", action="store_true",
+                    help="name the clusters with Claude and print the EA takeoff (needs ANTHROPIC_API_KEY)")
+    ap.add_argument("--legend", default=None, help="lead-sheet PDF or image with the legend/symbols (advisory)")
+    ap.add_argument("--legend-page", type=int, default=0)
+    ap.add_argument("--discipline", default="construction", help='e.g. "fire protection", "plumbing"')
+    ap.add_argument("--no-second-look", action="store_true",
+                    help="skip the multi-instance close-up re-check of flagged clusters (with --label)")
+    ap.add_argument("--out", default=None,
+                    help="without --label: write the report here; with --label: write counts.xlsx + markup PDF into this dir")
     args = ap.parse_args(argv)
 
     from .geometry import extract_pdf_geometry  # deferred: only the CLI needs PyMuPDF
 
     geom = extract_pdf_geometry(args.pdf, pages=[args.page])[0]
+
+    if args.label:
+        if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
+            print("ANTHROPIC_API_KEY is not set — --label is the LLM step and needs a key.", file=sys.stderr)
+            return 2
+        # The labeled path lives in the pipeline so the GUI and this CLI run one
+        # orchestration. Deferred import avoids a count<->pipeline cycle.
+        from . import pipeline
+        from .legend import _load_legend_attachment
+        from .models import CountsResult
+
+        legend_kind, legend_bytes = (
+            _load_legend_attachment(args.legend, args.legend_page) if args.legend else (None, None)
+        )
+        sheet = pipeline.counts_for_sheet(
+            geom, discipline=args.discipline, max_clusters=args.top, min_count=args.min_count,
+            max_extent_ft=args.max_extent_ft, second_look=not args.no_second_look,
+            legend_pdf=legend_bytes if legend_kind == "pdf" else None,
+            legend_image=legend_bytes if legend_kind == "image" else None,
+        )
+        print(sheet.report)
+        if args.out:
+            result = CountsResult(sheet_count=1)
+            pipeline._absorb_counts_sheet(result, sheet)
+            folder = pipeline.write_count_export(result, args.out, project_name="counts")
+            print(f"\nWrote {folder}/  (counts.xlsx + one instance-markup PDF)")
+        return 0
+
     scan = scan_symbols(geom, min_count=args.min_count, max_extent_ft=args.max_extent_ft)
     report = build_scan_report(geom, scan, top=args.top)
     print(report)

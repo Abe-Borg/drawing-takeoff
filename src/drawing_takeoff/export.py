@@ -191,3 +191,61 @@ def build_takeoff_workbook(tables: dict):
     for sheet in (ws, ws2, ws3):
         _autosize(sheet)
     return wb
+
+
+def build_counts_workbook(tables: dict):
+    """Pure: a counts takeoff -> an openpyxl ``Workbook`` (Summary / Detail / Review).
+
+    ``tables`` is the plain-data shape from :func:`drawing_takeoff.count.count_tables`
+    (``by_component``, ``detail`` rows, ``review`` notes) — aggregated across a
+    set by :class:`drawing_takeoff.models.CountsResult.as_tables`. No grand
+    total row on purpose: components are heterogeneous (you don't sum WCs and
+    sprinkler heads).
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+
+    bold = Font(bold=True)
+    wb = Workbook()
+
+    ws = wb.active
+    ws.title = "Summary"
+    ws.append(["Component", "Count", "Unit"])
+    for c in ws[1]:
+        c.font = bold
+    by = tables.get("by_component", {})
+    for component, n in sorted(by.items(), key=lambda kv: -kv[1]):
+        ws.append([component, int(n), "EA"])
+    if not by:
+        ws.append(["(no trusted countable clusters)", "", ""])
+
+    ws2 = wb.create_sheet("Detail")
+    detail = tables.get("detail", [])
+    # A multi-sheet set tags each row with its sheet (cluster ids repeat per
+    # sheet); the single-sheet CLI export omits it, so the column only appears
+    # when needed — same convention as the System×Size Detail tab.
+    has_sheet = any("sheet" in r for r in detail)
+    header = (["Sheet"] if has_sheet else []) + [
+        "Cluster", "Component", "Countable", "Counted", "Confidence", "Ambiguous",
+        "Count", "Drawn Size", "Variants", "Reasoning",
+    ]
+    ws2.append(header)
+    for c in ws2[1]:
+        c.font = bold
+    for r in detail:
+        row = [
+            r["cluster"], r["component"], "yes" if r["countable"] else "no",
+            "yes" if r["counted"] else "no", r["confidence"], "yes" if r["ambiguous"] else "no",
+            r["count"], r["size"], r["variants"], r["reasoning"],
+        ]
+        ws2.append(([r.get("sheet", "")] + row) if has_sheet else row)
+
+    ws3 = wb.create_sheet("Review")
+    ws3.append(["Review — confirm / not counted"])
+    ws3["A1"].font = bold
+    for note in tables.get("review", []):
+        ws3.append([note])
+
+    for sheet in (ws, ws2, ws3):
+        _autosize(sheet)
+    return wb

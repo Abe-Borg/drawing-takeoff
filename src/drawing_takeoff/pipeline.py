@@ -19,10 +19,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Sequence
 
+from . import count as _count
 from . import legend, measure
 from . import scale as _scale
 from .core import api_config
 from .models import (
+    CountsResult,
+    CountsSheet,
     SheetGeometry,
     SystemSizeResult,
     SystemSizeSheet,
@@ -35,6 +38,9 @@ __all__ = [
     "extract_system_size_takeoff",
     "system_size_for_sheet",
     "write_system_size_export",
+    "extract_count_takeoff",
+    "counts_for_sheet",
+    "write_count_export",
 ]
 
 # Upper bound on styles sent for labeling per sheet. High enough that all real
@@ -470,6 +476,213 @@ def extract_system_size_takeoff(
     if progress is not None:
         progress(total, total, "done")
     return result
+
+
+# ---------------------------------------------------------------------------
+# Counts takeoff (M9–M11): symbol clusters -> component names -> EA totals,
+# aggregated across a set. The third output mode; mirrors the System×Size
+# orchestration so the GUI and the `count --label` CLI run one code path.
+# ---------------------------------------------------------------------------
+def counts_for_sheet(
+    geom: SheetGeometry,
+    *,
+    client=None,
+    scale_label: str | None = None,
+    discipline: str = "construction",
+    max_clusters: int = 12,
+    min_count: int = 2,
+    max_extent_ft: float = 4.0,
+    second_look: bool = True,
+    legend_pdf: bytes | None = None,
+    legend_image: bytes | None = None,
+    log: Callable[[str], None] | None = None,
+) -> CountsSheet:
+    """One sheet, end to end into a counts table.
+
+    Congruence scan (M9) → one exemplar crop per cluster → component names via
+    one structured call (M10), with a wider multi-instance second look on
+    flagged clusters → ``{component: EA}`` + review (M11). The LLM only ever
+    names — every count traces back to exact geometry. Counts are scale-free:
+    a sheet with no scale still counts (the suspect cap falls back to points
+    and sizes report in pt), so unlike the length modes this never raises for
+    a missing scale.
+    """
+    from .geometry import render_symbol_crop_png  # deferred: the only PyMuPDF touch
+
+    log = log or _noop
+    sheet_id = f"{geom.ref.source}#p{geom.ref.page_index}"
+    pdf_path, page_index = geom.ref.source, geom.ref.page_index
+    ppf = _resolve_ppf(geom, scale_label)
+    if client is None:
+        from .client import get_client
+
+        client = get_client()
+
+    log(f"{sheet_id}: scanning repeated symbols… (congruence clustering)")
+    scan = _count.scan_symbols(geom, ppf=ppf, min_count=min_count, max_extent_ft=max_extent_ft)
+    clusters = scan.clusters[:max_clusters]
+    notes = _count.scan_review_notes(scan, top=max_clusters)
+    if not clusters:
+        log(f"{sheet_id}: no repeated symbols found.")
+        return CountsSheet(
+            sheet=sheet_id, source=pdf_path, page_index=page_index, clusters=[], labels={},
+            tables={"by_component": {}, "detail": [], "review": list(notes)},
+            report=f"=== Counts takeoff: {sheet_id} ===\n  no repeated symbols found.",
+            notes=notes,
+        )
+
+    # One highlighted exemplar crop per cluster — margin is scale-aware so the
+    # model sees a couple of feet of context (what the symbol sits on).
+    margin = 2.0 * ppf if ppf else 36.0
+    crops = {
+        c.id: render_symbol_crop_png(pdf_path, page_index, c.exemplar_bbox, margin_pt=margin)
+        for c in clusters
+    }
+    log(f"{sheet_id}: {len(clusters)} symbol cluster(s); naming with Claude… (this can take a moment)")
+    labels = legend.label_symbols(
+        geom, clusters, client=client, crops=crops, ppf=ppf, discipline=discipline,
+        legend_pdf=legend_pdf, legend_image=legend_image,
+    )
+
+    flagged = [c for c in clusters if legend.needs_second_look(labels[c.id])]
+    if flagged and second_look:
+        log(f"{sheet_id}: second look on {len(flagged)} flagged cluster(s) with Claude…")
+        sl_crops = {
+            c.id: [
+                render_symbol_crop_png(pdf_path, page_index, b, margin_pt=margin * 3, target_px=1024)
+                for b in c.instance_bboxes[:3]
+            ]
+            for c in flagged
+        }
+        labels.update(
+            legend.second_look_symbols(geom, flagged, labels, sl_crops, client=client,
+                                       ppf=ppf, discipline=discipline)
+        )
+
+    tables = _count.count_tables(clusters, labels, geom, ppf=ppf)
+    tables["review"] = list(tables["review"]) + notes
+    report = _count.build_counts_report(geom, clusters, labels, ppf=ppf)
+    if notes:
+        report += "\n\n" + "\n".join(notes)
+    return CountsSheet(
+        sheet=sheet_id, source=pdf_path, page_index=page_index,
+        clusters=list(clusters), labels=labels, tables=tables, report=report, notes=notes,
+    )
+
+
+def _absorb_counts_sheet(result: CountsResult, sheet: CountsSheet) -> None:
+    """Fold one sheet into the set-wide totals: sum the EA table, tag each detail
+    row with its sheet, and prefix review notes with the sheet id."""
+    result.sheets.append(sheet)
+    for component, n in sheet.tables.get("by_component", {}).items():
+        result.by_component[component] = result.by_component.get(component, 0) + n
+    for row in sheet.tables.get("detail", []):
+        result.detail.append({"sheet": sheet.sheet, **row})
+    for note in sheet.tables.get("review", []):
+        result.review.append(f"{sheet.sheet}: {note}")
+
+
+def extract_count_takeoff(
+    pdf_paths: Sequence[str | Path],
+    *,
+    client=None,
+    progress: Callable[[int, int, str], None] | None = None,
+    log: Callable[[str], None] | None = None,
+    scale_label: str | None = None,
+    discipline: str = "construction",
+    max_clusters: int = 12,
+    min_count: int = 2,
+    max_extent_ft: float = 4.0,
+    second_look: bool = True,
+    legend_pdf: bytes | None = None,
+    legend_image: bytes | None = None,
+) -> CountsResult:
+    """Run a counts takeoff over ``pdf_paths`` and aggregate across the set.
+
+    Each sheet is taken end to end by :func:`counts_for_sheet`; per-sheet
+    ``{component: EA}`` tables sum into one set-wide total, and every sheet's
+    clusters+labels are retained so :func:`write_count_export` can emit one
+    instance-markup PDF per sheet. One unreadable sheet is recorded in
+    ``errors`` and skipped — it never sinks the run. Args mirror
+    :func:`extract_system_size_takeoff`, plus the counts knobs
+    (``max_clusters``, ``min_count``, ``max_extent_ft``).
+    """
+    from .geometry import extract_pdf_geometry  # deferred: only this needs PyMuPDF
+
+    log = log or _noop
+    result = CountsResult()
+    sheets: list[SheetGeometry] = []
+    for path in pdf_paths:
+        log(f"Reading {Path(path).name}…")
+        try:
+            sheets.extend(extract_pdf_geometry(str(path)))
+        except Exception as exc:  # one unreadable PDF must not sink the run
+            result.errors.append(f"{path}: could not read PDF ({exc})")
+            log(f"{Path(path).name}: could not read PDF ({exc})")
+
+    total = len(sheets)
+    result.sheet_count = total
+    log(f"{total} sheet(s) to process from {len(pdf_paths)} file(s).")
+    if client is None and total:
+        from .client import get_client  # resolve once, share across sheets
+
+        client = get_client()
+
+    for i, geom in enumerate(sheets):
+        name = f"{Path(geom.ref.source).name} p{geom.ref.page_index}"
+        if progress is not None:
+            progress(i, total, name)
+        log(f"[{i + 1}/{total}] {name}")
+        try:
+            sheet = counts_for_sheet(
+                geom, client=client, scale_label=scale_label, discipline=discipline,
+                max_clusters=max_clusters, min_count=min_count, max_extent_ft=max_extent_ft,
+                second_look=second_look, legend_pdf=legend_pdf, legend_image=legend_image, log=log,
+            )
+            _absorb_counts_sheet(result, sheet)
+            result.diagnostics.append(f"{sheet.sheet}: {len(sheet.clusters)} cluster(s) named")
+        except Exception as exc:
+            result.errors.append(f"{geom.ref.source}#p{geom.ref.page_index}: {exc}")
+            result.diagnostics.append(f"{geom.ref.source}#p{geom.ref.page_index}: ERROR {exc}")
+            log(f"{name}: ERROR {exc}")
+
+    if progress is not None:
+        progress(total, total, "done")
+    return result
+
+
+def write_count_export(
+    result: CountsResult, out_dir: str | Path = ".", *, project_name: str = "counts"
+) -> Path:
+    """Write the counts deliverables into a ``<slug>_<timestamp>`` folder.
+
+    One Excel workbook (``counts.xlsx`` — Summary / Detail / Review, aggregated
+    across the set) plus one instance-markup PDF per sheet (every counted
+    instance boxed in its cluster's color, captioned with id × count ×
+    component, ``?`` when flagged). Returns the folder.
+    """
+    from datetime import datetime
+
+    from . import export
+    from .geometry import write_count_markup_pdf  # deferred: PyMuPDF for the markup
+
+    folder = Path(out_dir) / f"{export._slug(project_name)}_{datetime.now():%Y%m%d_%H%M%S}"
+    folder.mkdir(parents=True, exist_ok=True)
+    export.build_counts_workbook(result.as_tables()).save(folder / "counts.xlsx")
+
+    used: set[str] = set()
+    for sheet in result.sheets:
+        if not sheet.clusters:  # nothing to mark up on a sheet with no symbols
+            continue
+        name = f"{Path(sheet.source).stem}_p{sheet.page_index}_counts_markup.pdf"
+        n = 2
+        while name in used:  # two inputs can share a stem+page across folders
+            name = f"{Path(sheet.source).stem}_p{sheet.page_index}_{n}_counts_markup.pdf"
+            n += 1
+        used.add(name)
+        write_count_markup_pdf(sheet.source, sheet.page_index, sheet.clusters,
+                               str(folder / name), labels=sheet.labels)
+    return folder
 
 
 def write_system_size_export(
