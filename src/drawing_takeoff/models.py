@@ -265,6 +265,99 @@ class TakeoffResult:
         return [i for i in self.items if not i.trusted]
 
 
+@dataclass(frozen=True)
+class SymbolCluster:
+    """One distinct repeated symbol: every congruent instance of one drawn shape.
+
+    Built by :func:`drawing_takeoff.count.scan_symbols` from congruence
+    clustering — instances are grouped by a translation-invariant signature
+    canonicalized under the 8 right-angle rotations/mirrors — so ``count`` is
+    exact engine arithmetic, never an estimate. ``instance_bboxes`` locates
+    every placement on the page (the markup and the exemplar crop read it);
+    bboxes are ordered top-left first, and the exemplar is the first instance.
+    A cluster carries no name on purpose: naming is the M10 LLM step, keyed on
+    ``id`` — the same engine-measures / model-names split as networks.
+    """
+
+    id: str
+    signature_hash: str
+    instance_bboxes: tuple[BBox, ...]
+    paths_per_instance: int
+    width_pt: float                  # exemplar drawn size (rotated siblings swap w/h)
+    height_pt: float
+    style_keys: tuple[StyleKey, ...] = ()
+    # Distinct drawn arrangements absorbed by core extraction (annotation that
+    # co-locates with a symbol varies per placement). >1 earns a review note:
+    # the variants are one component to the engine, and a human confirms that.
+    variants: int = 1
+
+    @property
+    def count(self) -> int:
+        return len(self.instance_bboxes)
+
+    @property
+    def exemplar_bbox(self) -> BBox:
+        return self.instance_bboxes[0]
+
+    @property
+    def bbox(self) -> BBox:
+        """Spread of every instance — how much of the sheet the symbol covers."""
+        return (
+            min(b[0] for b in self.instance_bboxes), min(b[1] for b in self.instance_bboxes),
+            max(b[2] for b in self.instance_bboxes), max(b[3] for b in self.instance_bboxes),
+        )
+
+
+@dataclass
+class CountsSheet:
+    """One sheet's count takeoff (M9–M11): the ``clusters`` the engine counted
+    and the per-cluster ``labels`` the LLM named (kept so the instance markup can
+    be re-rendered from the original sheet), plus the plain-data ``tables`` the
+    Excel writer consumes and a human-readable ``report``.
+
+    Mirrors :class:`SystemSizeSheet`: the only PyMuPDF tie is re-rendering the
+    markup from ``source``/``page_index``; tables and report are pure data.
+    """
+
+    sheet: str                                       # "<source>#p<page>"
+    source: str                                      # PDF path, for re-rendering the markup
+    page_index: int
+    clusters: list = field(default_factory=list)     # list[SymbolCluster]
+    labels: dict = field(default_factory=dict)       # cluster id -> SystemLabel
+    tables: dict = field(default_factory=dict)       # by_component / detail / review
+    report: str = ""
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CountsResult:
+    """Aggregated count takeoff across a drawing set.
+
+    ``by_component`` sums the per-sheet ``{component: EA}`` tables; per-sheet
+    :class:`CountsSheet` entries are retained so the export can write one
+    instance-markup PDF per sheet. Mirrors :class:`SystemSizeResult`'s
+    error/diagnostics discipline: one bad sheet never sinks the run.
+    """
+
+    by_component: dict[str, int] = field(default_factory=dict)
+    detail: list[dict] = field(default_factory=list)   # per-cluster rows (with a 'sheet' key)
+    review: list[str] = field(default_factory=list)    # all not-counted / confirm notes
+    sheets: list[CountsSheet] = field(default_factory=list)
+    sheet_count: int = 0
+    errors: list[str] = field(default_factory=list)
+    diagnostics: list[str] = field(default_factory=list)
+
+    @property
+    def per_component_totals(self) -> dict[str, int]:
+        """EA by component, high-to-low — the headline table."""
+        return dict(sorted(self.by_component.items(), key=lambda kv: -kv[1]))
+
+    def as_tables(self) -> dict:
+        """The plain-data shape :func:`drawing_takeoff.export.build_counts_workbook`
+        consumes — aggregated across every sheet in the set."""
+        return {"by_component": self.by_component, "detail": self.detail, "review": self.review}
+
+
 @dataclass
 class SystemSizeSheet:
     """One sheet's System×Size takeoff (M5–M7): the labeled pipe ``networks``
