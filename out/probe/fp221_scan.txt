@@ -1,0 +1,23 @@
+=== M9 symbol clusters: FP2.21 - FIRE PROTECTION ENLARGED FLOOR PLAN - SOUTH.pdf (page 0) ===
+scale: 1/8" = 1'-0"  ->  9 pt/ft
+suspects (extent 2-36 pt): 15699 paths; dropped 921 linework-pen fragments + 1955 one-off parts -> 836 instances -> 62 repeated shapes (+22 singleton arrangements, 75 oversized blobs excluded)
+
+  top clusters (count = congruent instances)    count         size  paths vars  style
+    S0                                            131   0.0x1.0 ft      1   14  [0.67,0.67,0.67] w=0.24
+    S1                                             95   1.2x0.0 ft      1    9  [0.67,0.67,0.67] w=0.24
+    S2                                             82   0.0x4.0 ft      1   12  [0.67,0.67,0.67] w=0.24
+    S3                                             70   0.0x0.8 ft      1   11  [0.67,0.67,0.67] w=0.24
+    S4                                             58   0.0x1.5 ft      1    1  [0.00,0.00,0.00] w=0.24
+    S5                                             51   1.0x1.0 ft      8   16  [0.00,0.00,0.00] w=0.24; [none] w=0.0
+    S6                                             43   1.1x1.0 ft      1    4  [none] w=0.0
+    S7                                             26   0.4x1.0 ft      1    2  [none] w=0.0
+    S8                                             25   1.1x1.0 ft      1    2  [none] w=0.0
+    S9                                             22   0.0x0.3 ft      1    8  [0.67,0.67,0.67] w=0.24
+    S10                                            21   1.0x1.5 ft      1    2  [none] w=0.0
+    S11                                            18   1.0x1.1 ft      1    1  [none] w=0.0
+
+  NOT REVIEWED: 50 smaller clusters beyond the top 12 = 364 instances (raise the cluster cap to include them).
+  SINGLETONS: 22 one-off arrangements and 1955 one-off paths below the repeat floor (a unique fixture lands here — check the tag cross-check; --min-count 1 to include everything).
+  EXCLUDED as oversized pattern blobs: 75 merged groups over the 36 pt extent cap (hatch/pattern fill).
+
+  ADVISORY tag cross-check (fixture-tag-shaped text on the sheet): N-139 x1, N-141 x1, N-140 x1, N-142 x1, N-143 x1, N-144 x1, N-145 x1, N-146 x1, N-163 x1

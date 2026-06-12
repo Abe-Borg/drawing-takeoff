@@ -1,15 +1,18 @@
 # drawing-takeoff
 
-Vector-geometry **quantity takeoffs** (linear lengths first) from construction-drawing
+Vector-geometry **quantity takeoffs** (lengths and counts) from construction-drawing
 PDFs. Measurement runs on exact PyMuPDF **vector geometry** (resolution-independent, whole
 sheet, in PDF points); Claude vision is used **surgically** — read the legend once, then
-propagate system labels to every same-styled line by exact style match.
+propagate system labels to every same-styled line by exact style match; name one exemplar
+crop per repeated symbol, never count by looking.
 
-> **Status: end-to-end POC (M1–M4).** Drop in a set of vector sheets → a takeoff CSV grouped
-> by system. Geometry + scale (M1), border-aware run stitching + per-style footage (M2),
-> legend labeling via one structured Claude call (M3), and the `extract_takeoff` pipeline +
-> CSV export + drag-drop GUI (M4) all ship. See **`DESIGN_BUCKETING.md`** for the next
-> phase: binding measured footage to system × size buckets.
+> **Status: end-to-end POC (M1–M4) + System×Size (M5–M8) + Counts (M9–M12).** Drop in a set
+> of vector sheets → a takeoff CSV grouped by system. Geometry + scale (M1), border-aware run
+> stitching + per-style footage (M2), legend labeling via one structured Claude call (M3), and
+> the `extract_takeoff` pipeline + CSV export + drag-drop GUI (M4) all ship; **`DESIGN_BUCKETING.md`**
+> covers the shipped System × Size phase (M5–M8) and **`DESIGN_COUNTS.md`** the counts mode
+> (M9–M12): repeated symbols found + counted by congruence clustering, named from exemplar
+> crops, totaled as EA per component.
 
 ## Install & test
 
@@ -31,17 +34,23 @@ python -m drawing_takeoff.legend  SHEET.pdf [--legend LEAD_SHEET.pdf] [--discipl
 python -m drawing_takeoff.legend  SHEET.pdf --system-size [--out DIR] \
        [--legend LEAD_SHEET.pdf] [--top N] [--no-second-look]
 
+# Count repeated symbols (EA per component) with Claude naming the clusters:
+python -m drawing_takeoff.count   SHEET.pdf --label [--out DIR] \
+       [--legend LEAD_SHEET.pdf] [--discipline "fire protection"] [--no-second-look]
+
 # The GUI: drag in a set, pick an output mode, confirm the scale, run, save
 pip install -e ".[gui]"      # customtkinter + tkinterdnd2
 python -m drawing_takeoff.gui
 ```
 
-The GUI exposes both engine paths and the same knobs as the CLI: an **output
-mode** (*by system* → CSV, or *by system × size* → pipe networks + sizes +
-second-look re-check, saved as an Excel workbook + a marked-up PDF per sheet), an
-optional advisory **legend** attachment, and the system×size tuning (top-N
-networks, max styles, second look). A set is taken end to end and totals roll up
-across every sheet.
+The GUI exposes the engine paths and the same knobs as the CLI: an **output
+mode** — radio-style, one per run — (*by system* → CSV, *by system × size* →
+pipe networks + sizes + second-look re-check, Excel + a marked-up PDF per sheet,
+or *Counts* → repeated symbols counted by congruence + named from exemplar
+crops, EA per component, Excel + an instance-markup PDF per sheet), an optional
+advisory **legend** attachment, and per-mode tuning (top-N networks / max
+styles; top clusters / min repeats / max symbol size; second look). A set is
+taken end to end and totals roll up across every sheet.
 
 Headless, the engine is one call — PDFs in, a `TakeoffResult` out (per-system totals,
 flagged styles, per-sheet errors), with `export.write_takeoff_export(...)` for the CSVs:
@@ -56,6 +65,8 @@ result = extract_takeoff(["FP2.20.pdf", "FP2.21.pdf"], discipline="fire protecti
 ```bash
 python -m drawing_takeoff.diagnose SHEET.pdf   # M1 go/no-go: cleanliness / instances / scale
 python -m drawing_takeoff.measure  SHEET.pdf   # M2: per-style footage, border-excluded, cross-checked
+python -m drawing_takeoff.count    SHEET.pdf [--markup OUT.pdf]   # M9: repeated-symbol clusters,
+                                               # exact counts + every instance boxed on the markup
 ```
 
 ## Scale (the simplifying assumption)
@@ -76,10 +87,11 @@ src/drawing_takeoff/
   scale.py             # M1: scale-label -> points_per_foot; dimension verifier
   diagnose.py          # M1: go/no-go diagnostic report (pure; runs on models)
   measure.py           # M2: length primitives, run stitching, per-style footage
-  legend.py            # M3: legend labeling via one structured Claude call (style -> system)
-  pipeline.py          # M4: extract_takeoff (by system) + extract_system_size_takeoff (M5-M8)
-  export.py            # M4/M8: takeoff CSV + diagnostics + System x Size Excel workbook
-  gui.py               # M4/M8: drag-drop front-end over both engine paths (needs [gui])
+  count.py             # M9/M11: symbol congruence clustering -> exact counts; EA assembly + CLI
+  legend.py            # M3/M7/M10: labeling via structured Claude calls (styles / networks / symbols)
+  pipeline.py          # M4: extract_takeoff + extract_system_size_takeoff (M5-M8) + extract_count_takeoff (M9-M11)
+  export.py            # M4/M8/M11: takeoff CSV + diagnostics + System x Size / Counts Excel workbooks
+  gui.py               # M4/M8/M12: drag-drop front-end over the three engine paths (needs [gui])
 tests/                 # hermetic harness (sentinel key + SDK fakes) + smoke/scale/measure/
                        #   diagnose + a PyMuPDF-gated geometry test (synthetic vector PDF)
 ```

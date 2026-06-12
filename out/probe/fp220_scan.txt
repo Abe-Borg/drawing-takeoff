@@ -1,0 +1,23 @@
+=== M9 symbol clusters: FP2.20 - FIRE PROTECTION ENLARGED FLOOR PLAN - EAST.pdf (page 0) ===
+scale: 1/8" = 1'-0"  ->  9 pt/ft
+suspects (extent 2-36 pt): 20579 paths; dropped 1327 linework-pen fragments + 2054 one-off parts -> 1221 instances -> 82 repeated shapes (+59 singleton arrangements, 158 oversized blobs excluded)
+
+  top clusters (count = congruent instances)    count         size  paths vars  style
+    S0                                            275   0.0x1.0 ft      1   51  [0.67,0.67,0.67] w=0.24
+    S1                                            143   0.0x4.0 ft      1   32  [0.67,0.67,0.67] w=0.24
+    S2                                             63   0.6x0.0 ft      1   22  [0.67,0.67,0.67] w=0.24
+    S3                                             58   0.0x1.5 ft      1    1  [0.00,0.00,0.00] w=0.24
+    S4                                             48   0.0x0.4 ft      1   15  [0.67,0.67,0.67] w=0.24
+    S5                                             47   1.0x1.0 ft      8   24  [0.00,0.00,0.00] w=0.24; [none] w=0.0
+    S6                                             46   0.0x1.2 ft      1   12  [0.67,0.67,0.67] w=0.24
+    S7                                             41   1.0x1.1 ft      1    9  [none] w=0.0
+    S8                                             41   0.0x0.8 ft      1   14  [0.67,0.67,0.67] w=0.24
+    S9                                             41   0.0x0.5 ft      1   11  [0.67,0.67,0.67] w=0.24
+    S10                                            41   0.0x0.3 ft      1    8  [0.67,0.67,0.67] w=0.24
+    S11                                            39   0.5x0.5 ft      3   21  [0.00,0.00,0.00] w=0.36
+
+  NOT REVIEWED: 70 smaller clusters beyond the top 12 = 634 instances (raise the cluster cap to include them).
+  SINGLETONS: 59 one-off arrangements and 2054 one-off paths below the repeat floor (a unique fixture lands here — check the tag cross-check; --min-count 1 to include everything).
+  EXCLUDED as oversized pattern blobs: 158 merged groups over the 36 pt extent cap (hatch/pattern fill).
+
+  ADVISORY tag cross-check (fixture-tag-shaped text on the sheet): N-163 x2, N-145 x1, N-146 x1, N-157 x1, N-156 x1, N-158 x1, N-159 x1, N-153 x1, C-100 x1, N-152 x1, N-151 x1, N-150 x1

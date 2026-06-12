@@ -646,6 +646,274 @@ def second_look_networks(
     }
 
 
+# ---------------------------------------------------------------------------
+# M10: name the M9 symbol clusters (counts takeoff) — engine counts, model names
+# ---------------------------------------------------------------------------
+_SYMBOL_SYSTEM_PROMPT = """\
+You are a quantity-takeoff assistant for construction drawings. The geometry engine found the \
+REPEATED SYMBOLS on one sheet by exact congruence: each cluster is one distinct drawn shape, \
+repeated `count` times (rotated and mirrored placements already merged). You get one close-up \
+CROP of one exemplar instance per cluster — the symbol is outlined in red; surrounding linework \
+is context, not part of it — plus exact stats (count, drawn size at sheet scale, page spread).
+
+The counts and sizes are GROUND TRUTH — never recount, and supply no numbers. For each cluster \
+decide:
+  - `component`: what the symbol IS (e.g. "Sprinkler head (pendent)", "Water closet", \
+"Lavatory", "Supply diffuser", "Floor drain"). Use any legend given, reconciled against what \
+the crop actually shows — legends are advisory, frequently incomplete or wrong.
+  - `countable`: true only for a discrete physical component an EA count takeoff should total \
+(plumbing fixture, sprinkler head, diffuser, device, equipment). Door swings, hatch/tile \
+pattern, text or outlined lettering, size/length labels and their background masks, grid \
+bubbles, north arrows, section/detail markers, dimension ticks and other annotation are NOT \
+countable.
+  - `confidence` (high/medium/low) and `ambiguous`: when you cannot confidently name it, set \
+`ambiguous` true and `confidence` low — a human reviews flagged clusters; never guess.
+  - `reasoning`: one sentence citing what you saw.
+
+Reply with the labels JSON (the response format is enforced): a `labels` array \
+with exactly one entry for every symbol id given."""
+
+_SYMBOL_LABELS_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "labels": {
+            "type": "array",
+            "description": "One entry per symbol id given in the prompt.",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "symbol_id": {"type": "string"},
+                    "component": {
+                        "type": "string",
+                        "description": "What the symbol is; name annotation for what it is too.",
+                    },
+                    "countable": {
+                        "type": "boolean",
+                        "description": "True only for a discrete physical component to total (EA).",
+                    },
+                    "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                    "ambiguous": {
+                        "type": "boolean",
+                        "description": "True if you could not confidently name it; flagged for review.",
+                    },
+                    "reasoning": {"type": "string"},
+                },
+                "required": ["symbol_id", "component", "countable", "confidence", "ambiguous", "reasoning"],
+            },
+        }
+    },
+    "required": ["labels"],
+}
+
+
+def symbol_facts(geometry: SheetGeometry, clusters, *, ppf: float | None = None,
+                 discipline: str = "construction") -> str:
+    """Pure text the model reads beside the exemplar crops: per cluster, the
+    exact count / drawn size / parts / drawn-variant count / page spread.
+    Every number here comes from the engine."""
+    if ppf is None:
+        ppf = geometry.points_per_foot
+    pw, ph = geometry.page_width_pt, geometry.page_height_pt
+    lines = [
+        f"Discipline: {discipline}. Scale: {geometry.scale_label or 'unknown'}"
+        + (f" ({ppf:g} pt/ft)." if ppf else "."),
+        f"{len(clusters)} distinct repeated symbols (congruence clusters); counts are exact.",
+        "Per cluster:",
+    ]
+    for c in clusters:
+        if ppf:
+            size = f"{c.width_pt / ppf:.1f} x {c.height_pt / ppf:.1f} ft"
+        else:
+            size = f"{c.width_pt:.0f} x {c.height_pt:.0f} pt"
+        x0, y0, x1, y1 = c.bbox
+        pg = 100.0 * max((x1 - x0) / pw, (y1 - y0) / ph) if pw and ph else 0.0
+        lines.append(
+            f"  {c.id}: {c.count} instances, drawn size {size}, {c.paths_per_instance} path(s) "
+            f"per instance, {c.variants} drawn variant(s), instances spread over {pg:.0f}% of page"
+        )
+    return "\n".join(lines)
+
+
+def label_symbols(
+    geometry: SheetGeometry,
+    clusters,
+    *,
+    client=None,
+    crops: dict[str, bytes] | None = None,
+    ppf: float | None = None,
+    discipline: str = "construction",
+    legend_image: bytes | None = None,
+    legend_pdf: bytes | None = None,
+    legend_block: dict | None = None,
+    model: str | None = None,
+) -> dict[str, SystemLabel]:
+    """Name each symbol cluster via one structured call — the M10 step.
+
+    Generalizes :func:`label_networks` to M9 clusters: the model gets one
+    highlighted exemplar crop per cluster plus the engine's facts and returns,
+    per id, the component and whether it is countable (mapped onto
+    :class:`SystemLabel`: ``system`` = component, ``measurable`` = countable) —
+    keyed on the engine's cluster ids, so labels bind back to exact counts. It
+    supplies no numbers. Clusters the model omits default to an ambiguous,
+    non-countable label; the advisory legend rides the same transport (and
+    framing) as everywhere else.
+    """
+    clusters = list(clusters)
+    if not clusters:
+        return {}
+    if ppf is None:
+        ppf = geometry.points_per_foot
+    if model is None:
+        model = api_config.LABELING_MODEL_DEFAULT
+    if client is None:
+        from .client import get_client
+
+        client = get_client()
+
+    content: list[dict] = [
+        {"type": "text", "text": symbol_facts(geometry, clusters, ppf=ppf, discipline=discipline)}
+    ]
+    for c in clusters:
+        img = (crops or {}).get(c.id)
+        if img:
+            content.append({"type": "text", "text": f"Close-up of {c.id} (the symbol is outlined in red):"})
+            content.append(_image_block(img))
+    if legend_block or legend_pdf or legend_image:
+        content.append(
+            {
+                "type": "text",
+                "text": "Legend / symbols list from the project's lead sheet "
+                "(advisory — reconcile against the crops, do not trust blindly):",
+            }
+        )
+        if legend_block:
+            content.append(legend_block)
+        elif legend_pdf:
+            content.append(_document_block(legend_pdf))
+        else:
+            content.append(_image_block(legend_image))
+    content.append(
+        {"type": "text", "text": "Return the labels JSON, with one entry for every symbol id above."}
+    )
+
+    response = client.messages.create(
+        **_request_kwargs(
+            model=model, system=_SYMBOL_SYSTEM_PROMPT, content=content,
+            schema=_SYMBOL_LABELS_SCHEMA, client=client,
+        )
+    )
+    return _parse_symbol_response(response, clusters)
+
+
+def _parse_symbol_response(response, clusters) -> dict[str, SystemLabel]:
+    ids = {c.id for c in clusters}
+    out: dict[str, SystemLabel] = {}
+    for item in _labels_from_response(response):
+        sid = item.get("symbol_id")
+        if sid not in ids:
+            continue
+        out[sid] = SystemLabel(
+            system=str(item.get("component", "")).strip() or "(unnamed)",
+            measurable=bool(item.get("countable", False)),
+            confidence=str(item.get("confidence", "low")).lower(),
+            ambiguous=bool(item.get("ambiguous", False)),
+            reasoning=item.get("reasoning"),
+        )
+    for c in clusters:
+        out.setdefault(
+            c.id,
+            SystemLabel(system="(unlabeled)", measurable=False, confidence="low", ambiguous=True,
+                        reasoning="No label returned for this cluster."),
+        )
+    return out
+
+
+_SYMBOL_SECOND_LOOK_PROMPT = """\
+You are a quantity-takeoff assistant for construction drawings. A first pass could not \
+confidently name the repeated SYMBOLS listed here — each was flagged for human review. You now \
+get wider, high-resolution close-ups of up to three DIFFERENT instances of each flagged cluster \
+(the symbol outlined in red; the surroundings are context — what the symbol sits on or connects \
+to is often what identifies it). The first-pass label and reasoning are given; confirm or \
+overturn them based on what the close-ups actually show.
+
+The counts are GROUND TRUTH — never recount, and supply no numbers. The same rules apply: \
+`countable` only for a discrete physical component (fixture / head / diffuser / device); \
+annotation, text, masks and pattern are not countable. If the close-ups still do not settle \
+it, keep `ambiguous` true and `confidence` low — a human reviews every flagged cluster; never \
+guess.
+
+Reply with the labels JSON (the response format is enforced): a `labels` array \
+with exactly one entry for every symbol id given."""
+
+
+def second_look_symbols(
+    geometry: SheetGeometry,
+    clusters,
+    first_pass: dict[str, SystemLabel],
+    crops: dict[str, list[bytes]],
+    *,
+    client=None,
+    ppf: float | None = None,
+    discipline: str = "construction",
+    model: str | None = None,
+) -> dict[str, SystemLabel]:
+    """Re-name flagged clusters from wider multi-instance close-ups, in one call.
+
+    ``clusters`` is the flagged subset (see :func:`needs_second_look`) and
+    ``crops`` maps cluster id -> up to three close-up PNGs of different
+    instances — context disambiguates (the same oval reads as a lavatory on a
+    counter run and a urinal on a wall), which is why the second look widens
+    the margin and shows several placements instead of re-reading one. Defaults
+    to the escalation model. Returns labels for the given ids only — callers
+    merge with ``labels.update(...)``; reasoning is prefixed ``second look:``
+    and an omitted cluster keeps its flagged default, so the re-check can only
+    refine the review list, never silently widen trust.
+    """
+    clusters = [c for c in clusters if crops.get(c.id)]
+    if not clusters:
+        return {}
+    if model is None:
+        model = api_config.LABELING_ESCALATION_MODEL_DEFAULT
+    if client is None:
+        from .client import get_client
+
+        client = get_client()
+
+    content: list[dict] = [
+        {"type": "text", "text": symbol_facts(geometry, clusters, ppf=ppf, discipline=discipline)}
+    ]
+    notes = []
+    for c in clusters:
+        lab = first_pass.get(c.id)
+        if lab is not None:
+            notes.append(
+                f"  {c.id}: first pass said {lab.system!r} (countable={lab.measurable}, "
+                f"confidence={lab.confidence}, ambiguous={lab.ambiguous})"
+                + (f" — {lab.reasoning}" if lab.reasoning else "")
+            )
+    if notes:
+        content.append({"type": "text", "text": "First-pass labels (flagged for review):\n" + "\n".join(notes)})
+    for c in clusters:
+        for i, img in enumerate(crops[c.id][:3]):
+            content.append({"type": "text", "text": f"Instance {i + 1} of {c.id}:"})
+            content.append(_image_block(img))
+    content.append({"type": "text", "text": "Return the labels JSON, with one entry for every symbol id above."})
+
+    response = client.messages.create(
+        **_request_kwargs(
+            model=model, system=_SYMBOL_SECOND_LOOK_PROMPT, content=content,
+            schema=_SYMBOL_LABELS_SCHEMA, client=client,
+        )
+    )
+    out = _parse_symbol_response(response, clusters)
+    return {
+        sid: replace(lab, reasoning=f"second look: {lab.reasoning}" if lab.reasoning else "second look")
+        for sid, lab in out.items()
+    }
+
+
 def pipe_runs_from_style_labels(runs_by, style_labels):
     """Union of runs from every style the LLM is **confident** is pipe (``trusted``
     = measurable, not ambiguous, decent confidence) — the candidate set fed to

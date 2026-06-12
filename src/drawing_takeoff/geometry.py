@@ -268,6 +268,66 @@ def render_network_crop_png(
         return page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip, alpha=False).tobytes("png")
 
 
+def render_symbol_crop_png(
+    pdf_path: str,
+    page_index: int,
+    bbox: tuple[float, float, float, float],
+    *,
+    margin_pt: float = 36.0,
+    target_px: int = 512,
+    highlight: bool = True,
+) -> bytes:
+    """High-DPI close-up of one symbol instance — the M10 exemplar crop.
+
+    The same crop-to-target trick as :func:`render_network_crop_png`: scaling a
+    tight crop of an E-size sheet buys many times the whole-sheet render's
+    effective DPI, so one fixture lands at a few hundred legible pixels instead
+    of a 20-pixel smudge. ``highlight`` outlines the instance bbox so the model
+    knows exactly which marks ARE the symbol — everything else in the crop is
+    context (the counter run vs. the wall is what disambiguates a lav from a
+    urinal), not part of it.
+    """
+    with fitz.open(pdf_path) as doc:
+        page = doc[page_index]
+        x0, y0, x1, y1 = bbox
+        if highlight:
+            page.draw_rect(fitz.Rect(x0 - 2, y0 - 2, x1 + 2, y1 + 2),
+                           color=_NETWORK_COLORS[0], width=1.2)
+        clip = fitz.Rect(x0 - margin_pt, y0 - margin_pt, x1 + margin_pt, y1 + margin_pt) & page.rect
+        scale = target_px / max(clip.width, clip.height, 1.0)
+        return page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip, alpha=False).tobytes("png")
+
+
+def write_count_markup_pdf(
+    pdf_path: str,
+    page_index: int,
+    clusters: Sequence,
+    out_path: str,
+    *,
+    labels: dict | None = None,
+) -> None:
+    """Box every instance of every cluster (colored per cluster) and save a new
+    PDF — the count takeoff's trust artifact: a double count or a missed fixture
+    is visible at a glance. Each cluster is captioned at its exemplar with its
+    id, count, and (when ``labels`` is given) the component name — flagged
+    clusters get a trailing ``?`` so the review set stands out on paper.
+    Vector marks on the original page, crisp at any zoom.
+    """
+    with fitz.open(pdf_path) as doc:
+        page = doc[page_index]
+        for i, c in enumerate(clusters):
+            color = _NETWORK_COLORS[i % len(_NETWORK_COLORS)]
+            for (x0, y0, x1, y1) in c.instance_bboxes:
+                page.draw_rect(fitz.Rect(x0 - 2, y0 - 2, x1 + 2, y1 + 2), color=color, width=1.0)
+            lab = (labels or {}).get(c.id)
+            caption = f"{c.id} x{c.count}"
+            if lab is not None:
+                caption += f" {lab.system}" + ("" if lab.trusted else " ?")
+            ex0, ey0, _, _ = c.exemplar_bbox
+            page.insert_text(fitz.Point(ex0, max(ey0 - 6, 10)), caption, fontsize=10, color=color)
+        doc.save(out_path, garbage=3, deflate=True)
+
+
 def write_marked_up_pdf(pdf_path: str, page_index: int, networks: Sequence[Network], out_path: str) -> None:
     """Draw the given networks (colored + numbered) onto the sheet and save a new
     PDF — the marked-up takeoff an estimator opens, prints, and checks the colored
