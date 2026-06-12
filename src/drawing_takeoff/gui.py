@@ -35,6 +35,7 @@ from pathlib import Path
 from . import export, legend
 from .client import get_client
 from .core import api_key_store
+from .discipline import DISCIPLINES
 from .models import CountsResult, SystemSizeResult
 from .pipeline import (
     extract_count_takeoff,
@@ -56,6 +57,11 @@ try:  # the GUI extras are optional; the engine never needs them
     _GUI = True
 except Exception:  # pragma: no cover - exercised only without the [gui] extra
     _GUI = False
+
+# Dropdown sentinel for "let the engine detect the discipline per PDF" — the
+# default. The engine receives ``None`` in that case (see pipeline
+# ``_resolve_disciplines``); any other choice is passed through verbatim.
+_AUTO_DISCIPLINE = "Auto-detect"
 
 
 if _GUI:
@@ -149,7 +155,10 @@ if _GUI:
             self._scale = ctk.CTkEntry(opt, width=130, placeholder_text="1/8\" = 1'-0\"")
             self._scale.pack(side="left", padx=6)
             ctk.CTkLabel(opt, text="Discipline").pack(side="left", padx=6)
-            self._discipline = ctk.CTkEntry(opt, width=160, placeholder_text="fire protection")
+            self._discipline = ctk.CTkOptionMenu(
+                opt, width=160, values=[_AUTO_DISCIPLINE, *DISCIPLINES]
+            )
+            self._discipline.set(_AUTO_DISCIPLINE)
             self._discipline.pack(side="left", padx=6)
 
             # --- advisory legend (both modes) ------------------------------
@@ -316,7 +325,8 @@ if _GUI:
             if key:
                 os.environ["ANTHROPIC_API_KEY"] = key
             scale = self._scale.get().strip() or None
-            disc = self._discipline.get().strip() or "construction"
+            disc = self._discipline.get().strip()
+            disc = None if (not disc or disc == _AUTO_DISCIPLINE) else disc
             self._run_btn.configure(state="disabled")
             self._save_btn.configure(state="disabled")
             self._logbox.delete("1.0", "end")
@@ -339,7 +349,7 @@ if _GUI:
             self._set_step("Starting…")
             self._log_line(
                 f"Run started — {self._mode} mode, {len(self._pdfs)} file(s), "
-                f"discipline: {disc}, scale: {scale or 'auto-detect'}"
+                f"discipline: {disc or 'auto-detect'}, scale: {scale or 'auto-detect'}"
                 + (f", legend: {Path(legend_path).name}" if legend_path else "")
                 + "."
             )

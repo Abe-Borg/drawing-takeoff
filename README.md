@@ -48,8 +48,12 @@ mode** — radio-style, one per run — (*by system* → CSV, *by system × size
 pipe networks + sizes + second-look re-check, Excel + a marked-up PDF per sheet,
 or *Counts* → repeated symbols counted by congruence + named from exemplar
 crops, EA per component, Excel + an instance-markup PDF per sheet), an optional
-advisory **legend** attachment, and per-mode tuning (top-N networks / max
-styles; top clusters / min repeats / max symbol size; second look). A set is
+advisory **legend** attachment, a **discipline** dropdown (defaults to
+*Auto-detect*: each PDF — assumed single-discipline — is read from its filename,
+sheet numbers, titles and terminology, with a small Claude text classification
+as the fallback; pick Mechanical / Plumbing / Structural / Architectural /
+Electrical / Fire Protection to override), and per-mode tuning (top-N networks /
+max styles; top clusters / min repeats / max symbol size; second look). A set is
 taken end to end and totals roll up across every sheet.
 
 Headless, the engine is one call — PDFs in, a `TakeoffResult` out (per-system totals,
@@ -57,7 +61,8 @@ flagged styles, per-sheet errors), with `export.write_takeoff_export(...)` for t
 
 ```python
 from drawing_takeoff.pipeline import extract_takeoff
-result = extract_takeoff(["FP2.20.pdf", "FP2.21.pdf"], discipline="fire protection")
+result = extract_takeoff(["FP2.20.pdf", "FP2.21.pdf"])  # discipline auto-detected per PDF
+result = extract_takeoff(["FP2.20.pdf"], discipline="Fire Protection")  # or pin it
 ```
 
 ### No-LLM reports (geometry only)
@@ -87,6 +92,7 @@ src/drawing_takeoff/
   scale.py             # M1: scale-label -> points_per_foot; dimension verifier
   diagnose.py          # M1: go/no-go diagnostic report (pure; runs on models)
   measure.py           # M2: length primitives, run stitching, per-style footage
+  discipline.py        # trade auto-detect: keyword scorer over page text + filename (pure)
   count.py             # M9/M11: symbol congruence clustering -> exact counts; EA assembly + CLI
   legend.py            # M3/M7/M10: labeling via structured Claude calls (styles / networks / symbols)
   pipeline.py          # M4: extract_takeoff + extract_system_size_takeoff (M5-M8) + extract_count_takeoff (M9-M11)
