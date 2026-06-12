@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from . import count as _count
+from . import discipline as _discipline
 from . import legend, measure
 from . import scale as _scale
 from .core import api_config
@@ -58,6 +59,72 @@ def _resolve_ppf(geom: SheetGeometry, scale_label: str | None) -> float | None:
     if scale_label:
         return _scale.points_per_foot_from_label(scale_label)
     return geom.points_per_foot
+
+
+# The neutral discipline the prompts always anchored on; the last-resort value
+# when nothing (user, keyword scorer, Claude fallback) names the trade.
+_DEFAULT_DISCIPLINE = "construction"
+
+# Below this much total page text, skip the Claude classification fallback:
+# there is nothing for it to read either (typically a scanned/raster set), so
+# the call would be pure cost.
+_MIN_CLASSIFY_TEXT_CHARS = 200
+
+
+def _resolve_disciplines(
+    sheets: Sequence[SheetGeometry],
+    *,
+    requested: str | None,
+    client=None,
+    log: Callable[[str], None],
+) -> dict[str, str]:
+    """Per-source discipline for a run: ``{pdf_path: discipline}``.
+
+    An explicit ``requested`` value (GUI dropdown / CLI flag) wins outright.
+    Otherwise each PDF — assumed single-discipline — is auto-detected from its
+    own already-extracted text: the free keyword scorer first
+    (:func:`discipline.detect_discipline`), then a small text-only Claude
+    classification when the keywords are inconclusive, then
+    ``_DEFAULT_DISCIPLINE``. Every outcome is logged so the run shows what the
+    labels were anchored on; detection failures never raise.
+    """
+    by_source: dict[str, list[SheetGeometry]] = {}
+    for geom in sheets:
+        by_source.setdefault(geom.ref.source, []).append(geom)
+
+    out: dict[str, str] = {}
+    for source, geoms in by_source.items():
+        if requested:
+            out[source] = requested
+            continue
+        name = Path(source).name
+        texts = [" ".join(w.text for w in g.words) for g in geoms]
+        guess = _discipline.detect_discipline(texts, filename=name)
+        if guess is not None:
+            out[source] = guess.discipline
+            log(f"{name}: discipline auto-detected → {guess.discipline} ({guess.evidence})")
+            continue
+        if sum(len(t) for t in texts) >= _MIN_CLASSIFY_TEXT_CHARS:
+            classified = None
+            try:
+                c = client
+                if c is None:
+                    from .client import get_client  # deferred: tests inject a fake
+
+                    c = get_client()
+                classified = legend.classify_discipline(texts, filename=name, client=c)
+            except Exception as exc:  # detection must never sink a run
+                log(f"{name}: discipline classification failed ({exc}).")
+            if classified is not None:
+                disc, reasoning = classified
+                out[source] = disc
+                log(f"{name}: discipline classified by Claude → {disc}"
+                    + (f" ({reasoning})" if reasoning else ""))
+                continue
+        out[source] = _DEFAULT_DISCIPLINE
+        log(f"{name}: could not auto-detect the discipline; using "
+            f"'{_DEFAULT_DISCIPLINE}' (choose a discipline to override)")
+    return out
 
 
 def takeoff_for_sheet(
@@ -158,7 +225,7 @@ def extract_takeoff(
     scale_label: str | None = None,
     legend_image: bytes | None = None,
     legend_pdf: bytes | None = None,
-    discipline: str = "construction",
+    discipline: str | None = None,
 ) -> TakeoffResult:
     """Run a linear-length takeoff over ``pdf_paths`` and return a result.
 
@@ -178,7 +245,11 @@ def extract_takeoff(
         legend_image: optional PNG of the lead sheet's legend (advisory).
         legend_pdf: optional single-page PDF of the legend (advisory; preferred
             over ``legend_image`` — it carries the page's text layer).
-        discipline: e.g. ``"fire protection"`` — guides the legend.
+        discipline: e.g. ``"Fire Protection"`` — anchors the labeling prompts.
+            ``None`` auto-detects per PDF (each PDF is assumed
+            single-discipline) from its title-block text and filename, with a
+            Claude text-classification fallback — see
+            :func:`_resolve_disciplines`.
     """
     from .geometry import extract_pdf_geometry  # deferred: only this needs PyMuPDF
 
@@ -219,6 +290,8 @@ def extract_takeoff(
         else:
             log("Legend upload unavailable; sending it inline with each sheet.")
 
+    disciplines = _resolve_disciplines(sheets, requested=discipline, client=client, log=log)
+
     try:
         for i, geom in enumerate(sheets):
             name = f"{Path(geom.ref.source).name} p{geom.ref.page_index}"
@@ -233,7 +306,7 @@ def extract_takeoff(
                     legend_image=legend_image,
                     legend_pdf=legend_pdf,
                     legend_block=legend_block,
-                    discipline=discipline,
+                    discipline=disciplines[geom.ref.source],
                     log=log,
                 )
                 result.items.extend(items)
@@ -414,7 +487,7 @@ def extract_system_size_takeoff(
     progress: Callable[[int, int, str], None] | None = None,
     log: Callable[[str], None] | None = None,
     scale_label: str | None = None,
-    discipline: str = "construction",
+    discipline: str | None = None,
     max_styles: int = 12,
     top: int = 8,
     second_look: bool = True,
@@ -430,9 +503,10 @@ def extract_system_size_takeoff(
     marked-up PDF per sheet. One unreadable sheet is recorded in ``errors`` and
     skipped — it never sinks the run.
 
-    Args mirror :func:`extract_takeoff`, plus the System×Size knobs: ``top``
-    (largest N networks labeled per sheet), ``max_styles`` (styles classified per
-    sheet), and ``second_look`` (the high-DPI re-check of flagged networks).
+    Args mirror :func:`extract_takeoff` (including ``discipline=None`` =
+    auto-detect per PDF), plus the System×Size knobs: ``top`` (largest N
+    networks labeled per sheet), ``max_styles`` (styles classified per sheet),
+    and ``second_look`` (the high-DPI re-check of flagged networks).
     """
     from .geometry import extract_pdf_geometry  # deferred: only this needs PyMuPDF
 
@@ -454,6 +528,7 @@ def extract_system_size_takeoff(
         from .client import get_client  # resolve once, share across sheets
 
         client = get_client()
+    disciplines = _resolve_disciplines(sheets, requested=discipline, client=client, log=log)
 
     for i, geom in enumerate(sheets):
         name = f"{Path(geom.ref.source).name} p{geom.ref.page_index}"
@@ -462,7 +537,8 @@ def extract_system_size_takeoff(
         log(f"[{i + 1}/{total}] {name}")
         try:
             sheet = system_size_for_sheet(
-                geom, client=client, scale_label=scale_label, discipline=discipline,
+                geom, client=client, scale_label=scale_label,
+                discipline=disciplines[geom.ref.source],
                 max_styles=max_styles, top=top, second_look=second_look,
                 legend_pdf=legend_pdf, legend_image=legend_image, log=log,
             )
@@ -589,7 +665,7 @@ def extract_count_takeoff(
     progress: Callable[[int, int, str], None] | None = None,
     log: Callable[[str], None] | None = None,
     scale_label: str | None = None,
-    discipline: str = "construction",
+    discipline: str | None = None,
     max_clusters: int = 12,
     min_count: int = 2,
     max_extent_ft: float = 4.0,
@@ -604,8 +680,9 @@ def extract_count_takeoff(
     clusters+labels are retained so :func:`write_count_export` can emit one
     instance-markup PDF per sheet. One unreadable sheet is recorded in
     ``errors`` and skipped — it never sinks the run. Args mirror
-    :func:`extract_system_size_takeoff`, plus the counts knobs
-    (``max_clusters``, ``min_count``, ``max_extent_ft``).
+    :func:`extract_system_size_takeoff` (including ``discipline=None`` =
+    auto-detect per PDF), plus the counts knobs (``max_clusters``,
+    ``min_count``, ``max_extent_ft``).
     """
     from .geometry import extract_pdf_geometry  # deferred: only this needs PyMuPDF
 
@@ -627,6 +704,7 @@ def extract_count_takeoff(
         from .client import get_client  # resolve once, share across sheets
 
         client = get_client()
+    disciplines = _resolve_disciplines(sheets, requested=discipline, client=client, log=log)
 
     for i, geom in enumerate(sheets):
         name = f"{Path(geom.ref.source).name} p{geom.ref.page_index}"
@@ -635,7 +713,8 @@ def extract_count_takeoff(
         log(f"[{i + 1}/{total}] {name}")
         try:
             sheet = counts_for_sheet(
-                geom, client=client, scale_label=scale_label, discipline=discipline,
+                geom, client=client, scale_label=scale_label,
+                discipline=disciplines[geom.ref.source],
                 max_clusters=max_clusters, min_count=min_count, max_extent_ft=max_extent_ft,
                 second_look=second_look, legend_pdf=legend_pdf, legend_image=legend_image, log=log,
             )

@@ -31,6 +31,7 @@ from dataclasses import dataclass, replace
 
 from . import measure
 from .core import api_config
+from .discipline import DISCIPLINES
 from .models import SheetGeometry, StyleKey, SystemLabel
 
 _log = logging.getLogger(__name__)
@@ -379,6 +380,89 @@ def _parse_response(response, id_to_style: dict[str, StyleKey]) -> dict[StyleKey
                         reasoning="No label returned for this style."),
         )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Discipline classification — the LLM fallback behind discipline.detect_discipline
+# ---------------------------------------------------------------------------
+_DISCIPLINE_SYSTEM_PROMPT = """\
+You classify construction drawing sets by trade. You are given text extracted from \
+the sheets of ONE drawing/permit set (a single PDF, which carries a single \
+discipline) plus its filename. Decide which discipline the set belongs to, using \
+sheet numbers (M1.1 / P-201 / FP2.20 / E101 / S2.0 / A101), sheet titles, schedule \
+headings, and trade terminology. If the text does not clearly support one \
+discipline, answer "unknown" rather than guessing — a wrong discipline silently \
+skews every takeoff label downstream."""
+
+_DISCIPLINE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "discipline": {"type": "string", "enum": [*DISCIPLINES, "unknown"]},
+        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "reasoning": {"type": "string"},
+    },
+    "required": ["discipline", "confidence", "reasoning"],
+}
+
+# Per-page / per-request character budgets for the classification excerpt. The
+# discipline announces itself in title blocks and headings, so the head of each
+# page is plenty — no need to ship a whole schedule's text.
+_DISCIPLINE_PAGE_CHARS = 1_500
+_DISCIPLINE_TOTAL_CHARS = 12_000
+
+
+def classify_discipline(
+    page_texts, *, filename: str = "", client=None, model: str | None = None
+) -> tuple[str, str] | None:
+    """Classify one PDF's trade from its page text via a small text-only call.
+
+    The fallback behind :func:`drawing_takeoff.discipline.detect_discipline`
+    (the free, deterministic first pass): used only when the keyword evidence
+    is absent or contested. Sends the head of each page's text plus the
+    filename; the schema-enforced reply must pick a canonical discipline or
+    ``"unknown"``. Returns ``(discipline, reasoning)`` or ``None`` (unknown /
+    unparseable) — the caller decides the final default. ``client`` is the
+    usual duck-typed Anthropic client; the model defaults to the cheap
+    text-classification tier (``api_config.DISCIPLINE_MODEL_DEFAULT``).
+    """
+    if model is None:
+        model = api_config.DISCIPLINE_MODEL_DEFAULT
+    if client is None:
+        from .client import get_client
+
+        client = get_client()
+
+    excerpts = []
+    for i, text in enumerate(page_texts):
+        flat = " ".join((text or "").split())
+        if flat:
+            excerpts.append(f"--- page {i} ---\n{flat[:_DISCIPLINE_PAGE_CHARS]}")
+    summary = (
+        (f"Filename: {filename}\n" if filename else "")
+        + "Text extracted from the set's sheets:\n"
+        + "\n".join(excerpts)[:_DISCIPLINE_TOTAL_CHARS]
+    )
+    content = [
+        {"type": "text", "text": summary},
+        {"type": "text", "text": "Return the discipline JSON (the response format is enforced)."},
+    ]
+    response = client.messages.create(
+        **_request_kwargs(
+            model=model, system=_DISCIPLINE_SYSTEM_PROMPT, content=content,
+            schema=_DISCIPLINE_SCHEMA, client=client,
+        )
+    )
+    for block in getattr(response, "content", []) or []:
+        if getattr(block, "type", None) != "text":
+            continue
+        try:
+            data = json.loads(getattr(block, "text", "") or "")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(data, dict) and data.get("discipline") in DISCIPLINES:
+            return str(data["discipline"]), str(data.get("reasoning") or "").strip()
+    return None
 
 
 # ---------------------------------------------------------------------------

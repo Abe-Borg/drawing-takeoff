@@ -11,6 +11,8 @@ Model identifiers may be overridden via env vars:
     DRAWING_TAKEOFF_VERIFICATION_ESCALATION_MODEL — escalation (default Opus 4.8).
     DRAWING_TAKEOFF_TRIAGE_MODEL                — verification triage
                                               (default Haiku 4.5).
+    DRAWING_TAKEOFF_DISCIPLINE_MODEL            — discipline auto-detect
+                                              fallback (default Haiku 4.5).
     DRAWING_TAKEOFF_LABELING_MODEL              — sheet labeling (default
                                               Sonnet 4.6).
     DRAWING_TAKEOFF_LABELING_DENSE_MODEL        — labeling of dense sheets
@@ -55,6 +57,11 @@ VERIFICATION_ESCALATION_MODEL = os.environ.get(
 # whether a finding can be locally resolved or needs web verification. The
 # task is shallow classification over short inputs; Haiku fits.
 TRIAGE_MODEL_DEFAULT = os.environ.get("DRAWING_TAKEOFF_TRIAGE_MODEL", MODEL_HAIKU_45)
+
+# Discipline auto-detection fallback (legend.classify_discipline): a shallow
+# text-only classification over title-block/heading text, used only when the
+# deterministic keyword scorer is inconclusive. Haiku fits.
+DISCIPLINE_MODEL_DEFAULT = os.environ.get("DRAWING_TAKEOFF_DISCIPLINE_MODEL", MODEL_HAIKU_45)
 
 # Sheet labeling (legend.label_networks — the M7 set-of-marks call). Sonnet 4.6
 # was validated for this vision+reasoning task by the M7 probe at a fraction of
