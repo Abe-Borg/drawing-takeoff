@@ -104,6 +104,17 @@ tests/                 # hermetic harness (sentinel key + SDK fakes) + smoke/sca
 
 ## Licensing
 
-Depends on **PyMuPDF (AGPL-3.0)**, so this project is **AGPL-3.0-or-later** (see `LICENSE`).
+**AGPL-3.0-or-later** (see [`LICENSE`](LICENSE)). The choice is forced: **PyMuPDF** is
+AGPL-3.0-or-later or a paid Artifex commercial license, with no permissive option, so any
+distributed build is a combined work under the same terms. Every other dependency is
+permissive.
+
+Forks are free to use and modify, but must publish their source — including when a
+modified version is run as a network service (AGPL §13). Commercial use is *not*
+prohibited: no OSI-approved license may restrict a field of endeavor. For proprietary
+use, a separate commercial license can be negotiated — see
+**[`LICENSING.md`](LICENSING.md)** for the dual-licensing terms, the PyMuPDF caveat that
+comes with them, and what it would take to go non-commercial instead.
+
 Keep all PyMuPDF usage isolated to `geometry.py` so the backend stays swappable and the
 license boundary stays clean.
