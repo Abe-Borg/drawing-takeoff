@@ -28,8 +28,8 @@ and how to grant commercial exceptions.
 `geometry.py` imports **PyMuPDF**, which is distributed under
 **AGPL-3.0-or-later or a paid Artifex commercial license** — there is no
 permissive option. Anything distributed that links PyMuPDF is a combined work,
-so it must be offered under AGPL-3.0-or-later too. Every other dependency is
-permissive (see the inventory below), so PyMuPDF alone sets the floor.
+so it must be offered under AGPL-3.0-or-later too. No other dependency constrains
+the outbound license (see the inventory below), so PyMuPDF alone sets the floor.
 
 This is not a free choice until the PyMuPDF dependency is gone.
 
@@ -46,6 +46,11 @@ Anyone who forks this code may use and modify it, but:
   the takeoff engine, improving it privately, and selling it as closed SaaS.
 - **No relicensing.** A fork cannot be made proprietary, and no one may add
   further restrictions on top (§7).
+
+Both source obligations are trigger-based. A fork that is modified and used
+privately — never conveyed, and never exposed so that users interact with it
+remotely — owes nothing to anyone. Internal use is not what the AGPL reaches;
+distribution and remote interaction are.
 
 ## What the AGPL does *not* restrict
 
@@ -131,9 +136,14 @@ Verified against PyPI metadata.
 | httpx | BSD-3-Clause | no |
 | pydantic | MIT | no |
 | requests | Apache-2.0 | no |
-| certifi | MPL-2.0 | file-level only — no effect on this project |
+| certifi | MPL-2.0 | weak — file-level, covers only its own files |
 
-PyMuPDF is the only dependency that constrains the outbound license.
+PyMuPDF is the only dependency that constrains the outbound license. Note that
+certifi's MPL-2.0 is weak copyleft, not a permissive license: it imposes no
+reciprocal obligation on your code, but anyone distributing a build that bundles
+certifi still owes MPL compliance for certifi's own files — make their source
+available and keep the notices intact. Every other dependency above is
+permissive.
 
 ## Keeping the boundary clean
 

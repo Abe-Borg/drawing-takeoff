@@ -106,13 +106,15 @@ tests/                 # hermetic harness (sentinel key + SDK fakes) + smoke/sca
 
 **AGPL-3.0-or-later** (see [`LICENSE`](LICENSE)). The choice is forced: **PyMuPDF** is
 AGPL-3.0-or-later or a paid Artifex commercial license, with no permissive option, so any
-distributed build is a combined work under the same terms. Every other dependency is
-permissive.
+distributed build is a combined work under the same terms. No other dependency
+constrains the outbound license.
 
-Forks are free to use and modify, but must publish their source — including when a
-modified version is run as a network service (AGPL §13). Commercial use is *not*
-prohibited: no OSI-approved license may restrict a field of endeavor. For proprietary
-use, a separate commercial license can be negotiated — see
+Forks are free to use and modify. Conveying a fork means shipping its complete
+corresponding source under the same license, and running a modified version so that
+users interact with it remotely means offering them that source (AGPL §13) — but a fork
+modified and used privately, triggering neither, carries no publication obligation.
+Commercial use is *not* prohibited: no OSI-approved license may restrict a field of
+endeavor. For proprietary use, a separate commercial license can be negotiated — see
 **[`LICENSING.md`](LICENSING.md)** for the dual-licensing terms, the PyMuPDF caveat that
 comes with them, and what it would take to go non-commercial instead.
 
